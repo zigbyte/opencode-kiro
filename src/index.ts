@@ -36,6 +36,7 @@ import {
   type OpenCodeServerHooks,
   type OpenCodeServerPluginModule,
 } from "./types.ts";
+import { isOpenCodeV2Context, setupOpenCodeV2 } from "./opencode-v2.ts";
 
 export {
   KIRO_PROVIDER_ID,
@@ -234,10 +235,20 @@ export async function createKiroServerPlugin(
   return hooks;
 }
 
+async function setupPlugin(
+  ctx: OpenCodePluginContext,
+  options: KiroPluginOptions = {}
+): Promise<OpenCodeServerHooks | (() => Promise<void>)> {
+  if (isOpenCodeV2Context(ctx)) {
+    return setupOpenCodeV2(ctx, options);
+  }
+  return createKiroServerPlugin(ctx, options);
+}
+
 const plugin: OpenCodeServerPluginModule = {
   id: PLUGIN_ID,
-  server: createKiroServerPlugin,
-  setup: createKiroServerPlugin,
+  server: setupPlugin as OpenCodeServerPluginModule["server"],
+  setup: setupPlugin as OpenCodeServerPluginModule["setup"],
 };
 
 export default plugin;

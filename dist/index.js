@@ -659,6 +659,7 @@ class AcpClient {
   sessionUpdateListeners = new Map;
   metadataListeners = new Set;
   parseErrorListeners = new Set;
+  toolCallKinds = new Map;
   constructor(options = {}) {
     this.options = options;
     this.supervisor = new KiroProcessSupervisor({
@@ -945,6 +946,21 @@ class AcpClient {
       const sessionId = params["sessionId"];
       const update = params["update"];
       if (typeof sessionId === "string" && isRecord2(update)) {
+        const tcId = update["toolCallId"];
+        if (typeof tcId === "string" && tcId.length > 0) {
+          const meta = update["_meta"];
+          const kiroMeta = isRecord2(meta) ? meta["kiro"] : undefined;
+          const kiroToolName = isRecord2(kiroMeta) && typeof kiroMeta["toolName"] === "string" ? kiroMeta["toolName"] : undefined;
+          const recordedKind = typeof update["kind"] === "string" && update["kind"].trim().length > 0 ? update["kind"] : kiroToolName;
+          if (recordedKind) {
+            if (this.toolCallKinds.size >= 256) {
+              const oldest = this.toolCallKinds.keys().next().value;
+              if (oldest !== undefined)
+                this.toolCallKinds.delete(oldest);
+            }
+            this.toolCallKinds.set(tcId, recordedKind);
+          }
+        }
         const updateParams = params;
         const listeners = this.sessionUpdateListeners.get(sessionId);
         if (listeners) {
@@ -967,7 +983,13 @@ class AcpClient {
   }
   async handleInboundRequest(request) {
     if (request.method === "session/request_permission") {
-      const params = isRecord2(request.params) ? request.params : {};
+      const rawParams = isRecord2(request.params) ? request.params : {};
+      const tcId = rawParams.toolCall?.toolCallId;
+      const inferredKind = rawParams.toolCall?.kind === undefined && typeof tcId === "string" ? this.toolCallKinds.get(tcId) : undefined;
+      const params = inferredKind && rawParams.toolCall ? {
+        ...rawParams,
+        toolCall: { ...rawParams.toolCall, kind: inferredKind }
+      } : rawParams;
       try {
         const policy = this.options.permissionPolicy ?? "deny_by_default";
         const outcome = this.options.onPermissionRequest ? await this.options.onPermissionRequest(params) : evaluatePermissionPolicy(policy, params);

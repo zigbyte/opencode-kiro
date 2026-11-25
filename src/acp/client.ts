@@ -192,6 +192,8 @@ export class AcpClient {
     (error: Error, rawLine: string) => void
   >();
 
+  private readonly toolCallKinds = new Map<string, string>();
+
   constructor(options: KiroPluginOptions = {}) {
     this.options = options;
     this.supervisor = new KiroProcessSupervisor({
@@ -616,6 +618,29 @@ export class AcpClient {
       const sessionId = params["sessionId"];
       const update = params["update"];
       if (typeof sessionId === "string" && isRecord(update)) {
+        // Remember toolCallId -> kind / _meta.kiro.toolName from `tool_call` updates
+        // because kiro-cli 3.6+ omits `kind` on the subsequent `session/request_permission`.
+        const tcId = update["toolCallId"];
+        if (typeof tcId === "string" && tcId.length > 0) {
+          const meta = update["_meta"];
+          const kiroMeta = isRecord(meta) ? meta["kiro"] : undefined;
+          const kiroToolName =
+            isRecord(kiroMeta) && typeof kiroMeta["toolName"] === "string"
+              ? kiroMeta["toolName"]
+              : undefined;
+          const recordedKind =
+            typeof update["kind"] === "string" && update["kind"].trim().length > 0
+              ? update["kind"]
+              : kiroToolName;
+          if (recordedKind) {
+            if (this.toolCallKinds.size >= 256) {
+              const oldest = this.toolCallKinds.keys().next().value;
+              if (oldest !== undefined) this.toolCallKinds.delete(oldest);
+            }
+            this.toolCallKinds.set(tcId, recordedKind);
+          }
+        }
+
         const updateParams = params as unknown as AcpSessionUpdateParams;
         const listeners = this.sessionUpdateListeners.get(sessionId);
         if (listeners) {
@@ -644,9 +669,22 @@ export class AcpClient {
 
   private async handleInboundRequest(request: JsonRpcRequest): Promise<void> {
     if (request.method === "session/request_permission") {
-      const params = (
+      const rawParams = (
         isRecord(request.params) ? request.params : {}
       ) as unknown as AcpPermissionRequestParams;
+      // Enrich missing `toolCall.kind` from the preceding `tool_call` notification
+      const tcId = rawParams.toolCall?.toolCallId;
+      const inferredKind =
+        rawParams.toolCall?.kind === undefined && typeof tcId === "string"
+          ? this.toolCallKinds.get(tcId)
+          : undefined;
+      const params: AcpPermissionRequestParams =
+        inferredKind && rawParams.toolCall
+          ? {
+              ...rawParams,
+              toolCall: { ...rawParams.toolCall, kind: inferredKind },
+            }
+          : rawParams;
       try {
         const policy = this.options.permissionPolicy ?? "deny_by_default";
         const outcome: AcpPermissionResponse = this.options.onPermissionRequest

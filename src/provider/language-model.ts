@@ -69,6 +69,10 @@ export interface KiroToolCall {
   toolName: string;
   args: unknown;
   status?: string;
+  providerExecuted: true;
+  dynamic: true;
+  result?: unknown;
+  isError?: boolean;
 }
 
 export interface KiroGenerateResult {
@@ -86,8 +90,22 @@ export interface KiroGenerateResult {
 export type KiroStreamPart =
   | { type: "text-delta"; textDelta: string; delta: string }
   | { type: "reasoning-delta"; textDelta: string; delta: string }
-  | { type: "tool-call"; toolCallId: string; toolName: string; args: unknown }
-  | { type: "tool-result"; toolCallId: string; toolName?: string; result: unknown }
+  | {
+      type: "tool-call";
+      toolCallId: string;
+      toolName: string;
+      args: unknown;
+      providerExecuted: true;
+      dynamic: true;
+    }
+  | {
+      type: "tool-result";
+      toolCallId: string;
+      toolName: string;
+      result: unknown;
+      isError?: boolean;
+      dynamic: true;
+    }
   | { type: "finish"; finishReason: KiroFinishReason; usage: KiroUsage }
   | { type: "error"; error: unknown };
 
@@ -314,6 +332,106 @@ function normalizeUsage(result: AcpPromptResult): KiroUsage {
   };
 }
 
+const TERMINAL_TOOL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "error",
+  "cancelled",
+]);
+
+const ERROR_TOOL_STATUSES = new Set(["failed", "error", "cancelled"]);
+
+function toNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Resolves the canonical tool name from an ACP `tool_call` or `tool_call_update` payload:
+ *   `_meta.kiro.toolName` -> `toolName` -> `name` -> `kind` -> `title` -> `"kiro_tool"`
+ */
+export function resolveCanonicalToolName(
+  update: Record<string, unknown>
+): string {
+  const meta = isPlainRecord(update._meta) ? update._meta : undefined;
+  const kiroMeta = meta && isPlainRecord(meta.kiro) ? meta.kiro : undefined;
+
+  return (
+    toNonEmptyString(kiroMeta?.toolName) ??
+    toNonEmptyString(update.toolName) ??
+    toNonEmptyString(update.name) ??
+    toNonEmptyString(update.kind) ??
+    toNonEmptyString(update.title) ??
+    "kiro_tool"
+  );
+}
+
+function extractToolContentText(update: Record<string, unknown>): string | null {
+  const content = update.content;
+  const texts: string[] = [];
+
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!isPlainRecord(item)) continue;
+      // ACP nested content: { type: "content", content: { type: "text", text: "..." } }
+      if (item.type === "content" && isPlainRecord(item.content)) {
+        const nestedText = toNonEmptyString(item.content.text);
+        if (nestedText !== null) {
+          texts.push(nestedText);
+        }
+        continue;
+      }
+      // Direct text block: { type: "text", text: "..." }
+      if (item.type === "text") {
+        const directText = toNonEmptyString(item.text);
+        if (directText !== null) {
+          texts.push(directText);
+        }
+      }
+    }
+  } else if (isPlainRecord(content)) {
+    if (content.type === "text") {
+      const directText = toNonEmptyString(content.text);
+      if (directText !== null) {
+        texts.push(directText);
+      }
+    } else if (content.type === "content" && isPlainRecord(content.content)) {
+      const nestedText = toNonEmptyString(content.content.text);
+      if (nestedText !== null) {
+        texts.push(nestedText);
+      }
+    }
+  }
+
+  return texts.length > 0 ? texts.join("\n") : null;
+}
+
+function hasExtractableToolOutput(update: Record<string, unknown>): boolean {
+  if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    return true;
+  }
+  return extractToolContentText(update) !== null;
+}
+
+function extractToolResult(
+  update: Record<string, unknown>,
+  status: string | null
+): unknown {
+  if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    return update.rawOutput;
+  }
+  const text = extractToolContentText(update);
+  if (text !== null) {
+    return text;
+  }
+  return { status: status ?? "completed" };
+}
+
 // ---------------------------------------------------------------------------
 // KiroAcpLanguageModel
 // ---------------------------------------------------------------------------
@@ -391,13 +509,37 @@ export class KiroAcpLanguageModel {
           }
           case "tool_call":
           case "tool_call_update": {
-            const id = update.toolCallId ?? `tool_${toolCallsById.size + 1}`;
+            const id =
+              toNonEmptyString(update.toolCallId) ?? `tool_${toolCallsById.size + 1}`;
             const existing = toolCallsById.get(id);
+            const lockedName = existing?.toolName ?? resolveCanonicalToolName(update);
+            const status = toNonEmptyString(update.status)?.toLowerCase() ?? null;
+            const isTerminal = status !== null && TERMINAL_TOOL_STATUSES.has(status);
+            const hasOutput = hasExtractableToolOutput(update);
+            const isError =
+              status !== null && ERROR_TOOL_STATUSES.has(status)
+                ? true
+                : existing?.isError;
+
+            let nextResult = existing?.result;
+            if (isTerminal || (status === null && hasOutput)) {
+              nextResult = extractToolResult(update, status);
+            }
+
             toolCallsById.set(id, {
               toolCallId: id,
-              toolName: update.title ?? update.kind ?? existing?.toolName ?? "tool",
-              args: update.rawInput !== undefined ? update.rawInput : (existing?.args ?? {}),
-              status: update.status ?? existing?.status,
+              toolName: lockedName,
+              args:
+                existing !== undefined
+                  ? existing.args
+                  : update.rawInput !== undefined
+                    ? update.rawInput
+                    : {},
+              status: toNonEmptyString(update.status) ?? existing?.status,
+              providerExecuted: true,
+              dynamic: true,
+              ...(nextResult !== undefined ? { result: nextResult } : {}),
+              ...(isError ? { isError: true } : {}),
             });
             break;
           }
@@ -405,10 +547,19 @@ export class KiroAcpLanguageModel {
       },
     });
 
+    const finalizedToolCalls = Array.from(toolCallsById.values()).map((tc) =>
+      tc.result !== undefined
+        ? tc
+        : {
+            ...tc,
+            result: { status: tc.status ?? "completed" },
+          }
+    );
+
     return {
       text,
       reasoning,
-      toolCalls: Array.from(toolCallsById.values()),
+      toolCalls: finalizedToolCalls,
       finishReason: mapAcpStopReason(promptResult.stopReason),
       usage: normalizeUsage(promptResult),
       rawResponse: {
@@ -505,6 +656,11 @@ export class KiroAcpLanguageModel {
 
             const blocks = convertPromptToAcpBlocks(options.prompt, options.system);
 
+            const toolState = new Map<
+              string,
+              { toolName: string; emittedCall: boolean; emittedFinalResult: boolean }
+            >();
+
             const result = await this.acpClient.prompt(session.sessionId, blocks, {
               signal: internalAbort.signal,
               onUpdate: (params) => {
@@ -533,29 +689,55 @@ export class KiroAcpLanguageModel {
                     }
                     break;
                   }
-                  case "tool_call": {
-                    safeEnqueue({
-                      type: "tool-call",
-                      toolCallId: update.toolCallId ?? "tool_call",
-                      toolName: update.title ?? update.kind ?? "tool",
-                      args: update.rawInput ?? {},
-                    });
-                    break;
-                  }
+                  case "tool_call":
                   case "tool_call_update": {
-                    if (update.rawOutput !== undefined || update.status === "completed") {
-                      safeEnqueue({
-                        type: "tool-result",
-                        toolCallId: update.toolCallId ?? "tool_call",
-                        toolName: update.title ?? update.kind,
-                        result: update.rawOutput ?? null,
-                      });
-                    } else if (update.rawInput !== undefined) {
+                    const id =
+                      toNonEmptyString(update.toolCallId) ?? `tool_${toolState.size + 1}`;
+                    let state = toolState.get(id);
+                    if (!state) {
+                      state = {
+                        toolName: resolveCanonicalToolName(update),
+                        emittedCall: false,
+                        emittedFinalResult: false,
+                      };
+                      toolState.set(id, state);
+                    }
+
+                    // Emit tool-call ONCE per toolCallId with permanently locked toolName
+                    if (!state.emittedCall) {
+                      state.emittedCall = true;
                       safeEnqueue({
                         type: "tool-call",
-                        toolCallId: update.toolCallId ?? "tool_call",
-                        toolName: update.title ?? update.kind ?? "tool",
-                        args: update.rawInput,
+                        toolCallId: id,
+                        toolName: state.toolName,
+                        args: update.rawInput ?? {},
+                        providerExecuted: true,
+                        dynamic: true,
+                      });
+                    }
+
+                    const status = toNonEmptyString(update.status)?.toLowerCase() ?? null;
+                    const isTerminal =
+                      status !== null && TERMINAL_TOOL_STATUSES.has(status);
+                    const hasOutput = hasExtractableToolOutput(update);
+                    const shouldFinalize =
+                      isTerminal ||
+                      (update.sessionUpdate === "tool_call_update" &&
+                        status === null &&
+                        hasOutput);
+
+                    if (shouldFinalize && !state.emittedFinalResult) {
+                      const isError =
+                        status !== null && ERROR_TOOL_STATUSES.has(status);
+                      const extracted = extractToolResult(update, status);
+                      state.emittedFinalResult = true;
+                      safeEnqueue({
+                        type: "tool-result",
+                        toolCallId: id,
+                        toolName: state.toolName,
+                        result: extracted,
+                        ...(isError ? { isError: true } : {}),
+                        dynamic: true,
                       });
                     }
                     break;
@@ -563,6 +745,20 @@ export class KiroAcpLanguageModel {
                 }
               },
             });
+
+            // Synthesize final tool-result for any dangling provider-executed tool calls
+            for (const [toolCallId, state] of toolState.entries()) {
+              if (state.emittedCall && !state.emittedFinalResult) {
+                state.emittedFinalResult = true;
+                safeEnqueue({
+                  type: "tool-result",
+                  toolCallId,
+                  toolName: state.toolName,
+                  result: { status: "completed" },
+                  dynamic: true,
+                });
+              }
+            }
 
             safeEnqueue({
               type: "finish",

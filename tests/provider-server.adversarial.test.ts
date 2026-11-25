@@ -18,9 +18,14 @@ import plugin, {
 } from "../src/index.ts";
 import {
   convertPromptToAcpBlocks,
+  resolveCanonicalToolName,
   type KiroAcpClientLike,
   type KiroStreamPart,
 } from "../src/provider/language-model.ts";
+import {
+  setupOpenCodeV2,
+  type OpenCodeV2Context,
+} from "../src/opencode-v2.ts";
 import type {
   AcpContentBlock,
   AcpPromptResult,
@@ -33,6 +38,7 @@ import type {
 } from "../src/types.ts";
 
 const MOCK_CLI = resolve(import.meta.dir, "fixtures/mock-kiro-cli.ts");
+const MOCK_V3_TOOLS_CLI = resolve(import.meta.dir, "fixtures/mock-kiro-v3-tools-cli.ts");
 
 const SAMPLE_MODELS: KiroModelInfo[] = [
   {
@@ -124,6 +130,7 @@ afterEach(async () => {
   delete process.env.MOCK_KIRO_SLOW_MS;
   delete process.env.MOCK_KIRO_CRASH_ON_PROMPT;
   delete process.env.MOCK_KIRO_AUTH;
+  delete process.env.MOCK_KIRO_TOOL_FAIL;
 });
 
 // ===========================================================================
@@ -891,5 +898,524 @@ describe("Adversarial: KiroCreditsStore Numeric & Listener Hardening", () => {
     store.updateFromMetadata({ creditsUsed: 20, creditsLimit: 100 });
     expect(receivedB).toEqual([10]);
     expect(receivedD).toEqual([10]);
+  });
+});
+
+// ===========================================================================
+// 6. Canonical Tool-Call State Machine & AI SDK v3 Adapter Attacks
+// ===========================================================================
+
+describe("Adversarial: Canonical Tool-Call State Machine & AI SDK v3 Adapter", () => {
+  test("kiro-cli 3.6.1 web_search sequence (completed & failed): emits tool-call ONCE with locked toolName, providerExecuted: true, dynamic: true, and matching tool-result", async () => {
+    for (const terminalStatus of ["completed", "failed"] as const) {
+      const fakeClient = createFakeAcpClient({
+        async prompt(sessionId, _blocks, options) {
+          options?.onUpdate?.({
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "call_ws_1",
+              title: "Searching the web",
+              kind: "search",
+              status: "pending",
+              rawInput: { query: "opencode 2.x" },
+              _meta: { kiro: { toolName: "web_search" } },
+            },
+          });
+          options?.onUpdate?.({
+            sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: "call_ws_1",
+              title: "web_search",
+              status: terminalStatus,
+              content: [
+                {
+                  type: "content",
+                  content: {
+                    type: "text",
+                    text:
+                      terminalStatus === "failed"
+                        ? "Search error: 503"
+                        : "Result: OpenCode 2.x docs",
+                  },
+                },
+              ],
+            },
+          });
+          return { stopReason: "end_turn", usage: { inputTokens: 12, outputTokens: 8 } };
+        },
+      });
+
+      const model = new KiroAcpLanguageModel("kiro/claude-sonnet-4.5", {
+        acpClient: fakeClient,
+      });
+
+      const { stream } = await model.doStream({ prompt: "search opencode" });
+      const parts = await collectStream(stream);
+
+      const toolCalls = parts.filter(
+        (p): p is Extract<KiroStreamPart, { type: "tool-call" }> =>
+          p.type === "tool-call"
+      );
+      const toolResults = parts.filter(
+        (p): p is Extract<KiroStreamPart, { type: "tool-result" }> =>
+          p.type === "tool-result"
+      );
+
+      expect(toolCalls).toHaveLength(1);
+      expect(toolResults).toHaveLength(1);
+
+      const tc = toolCalls[0]!;
+      const tr = toolResults[0]!;
+
+      expect(tc.toolCallId).toBe("call_ws_1");
+      expect(tc.toolName).toBe("web_search");
+      expect(tc.providerExecuted).toBe(true);
+      expect(tc.dynamic).toBe(true);
+
+      expect(tr.toolCallId).toBe("call_ws_1");
+      expect(tr.toolName).toBe("web_search");
+      expect(tr.dynamic).toBe(true);
+      expect(tr.result).not.toBeNull();
+      expect(tr.result).not.toBeUndefined();
+      expect(() => JSON.stringify(tr.result)).not.toThrow();
+
+      if (terminalStatus === "failed") {
+        expect(tr.isError).toBe(true);
+        expect(tr.result).toBe("Search error: 503");
+      } else {
+        expect(tr.isError).toBeUndefined();
+        expect(tr.result).toBe("Result: OpenCode 2.x docs");
+      }
+
+      // Also verify doGenerate consistency
+      const gen = await model.doGenerate({ prompt: "search opencode" });
+      expect(gen.toolCalls).toHaveLength(1);
+      expect(gen.toolCalls[0]?.toolName).toBe("web_search");
+      expect(gen.toolCalls[0]?.providerExecuted).toBe(true);
+      expect(gen.toolCalls[0]?.dynamic).toBe(true);
+      expect(gen.toolCalls[0]?.isError).toBe(
+        terminalStatus === "failed" ? true : undefined
+      );
+    }
+  });
+
+  test("changing title / _meta.kiro.toolName mid-flight NEVER mutates locked toolName for an existing toolCallId", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        // Initial call locks canonical toolName to "Searching the web" (no _meta, no kind)
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_lock_1",
+            title: "Searching the web",
+            rawInput: { q: "test" },
+          },
+        });
+        // Mid-flight update tries to change title AND inject _meta.kiro.toolName
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_lock_1",
+            title: "web_search",
+            _meta: { kiro: { toolName: "hijacked_tool" } },
+            status: "completed",
+            rawOutput: { hits: 5 },
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "lock test" });
+    const parts = await collectStream(stream);
+
+    const tc = parts.find(
+      (p): p is Extract<KiroStreamPart, { type: "tool-call" }> =>
+        p.type === "tool-call"
+    );
+    const tr = parts.find(
+      (p): p is Extract<KiroStreamPart, { type: "tool-result" }> =>
+        p.type === "tool-result"
+    );
+    expect(tc?.toolName).toBe("Searching the web");
+    expect(tr?.toolName).toBe("Searching the web");
+
+    const gen = await model.doGenerate({ prompt: "lock test" });
+    expect(gen.toolCalls[0]?.toolName).toBe("Searching the web");
+  });
+
+  test("out-of-order tool_call_update arriving WITHOUT prior tool_call emits tool-call FIRST, then tool-result with identical toolName", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_ooo_1",
+            title: "web_search",
+            _meta: { kiro: { toolName: "web_search" } },
+            status: "completed",
+            content: [
+              { type: "content", content: { type: "text", text: "Out-of-order result" } },
+            ],
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "ooo test" });
+    const parts = await collectStream(stream);
+
+    const callIdx = parts.findIndex((p) => p.type === "tool-call");
+    const resultIdx = parts.findIndex((p) => p.type === "tool-result");
+    expect(callIdx).toBeGreaterThanOrEqual(0);
+    expect(resultIdx).toBeGreaterThan(callIdx);
+
+    const tc = parts[callIdx] as Extract<KiroStreamPart, { type: "tool-call" }>;
+    const tr = parts[resultIdx] as Extract<KiroStreamPart, { type: "tool-result" }>;
+    expect(tc.toolCallId).toBe("call_ooo_1");
+    expect(tc.toolName).toBe("web_search");
+    expect(tc.providerExecuted).toBe(true);
+    expect(tc.dynamic).toBe(true);
+    expect(tr.toolCallId).toBe("call_ooo_1");
+    expect(tr.toolName).toBe("web_search");
+    expect(tr.result).toBe("Out-of-order result");
+    expect(tr.dynamic).toBe(true);
+  });
+
+  test("dangling tool_call with no terminal tool_call_update before end_turn synthesizes final tool-result before finish", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_dangle_1",
+            _meta: { kiro: { toolName: "web_search" } },
+            rawInput: { query: "dangling" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "dangle test" });
+    const parts = await collectStream(stream);
+
+    const callIdx = parts.findIndex((p) => p.type === "tool-call");
+    const resultIdx = parts.findIndex((p) => p.type === "tool-result");
+    const finishIdx = parts.findIndex((p) => p.type === "finish");
+
+    expect(callIdx).toBeGreaterThanOrEqual(0);
+    expect(resultIdx).toBeGreaterThan(callIdx);
+    expect(finishIdx).toBeGreaterThan(resultIdx);
+
+    const tr = parts[resultIdx] as Extract<KiroStreamPart, { type: "tool-result" }>;
+    expect(tr.toolCallId).toBe("call_dangle_1");
+    expect(tr.toolName).toBe("web_search");
+    expect(tr.dynamic).toBe(true);
+    expect(tr.result).not.toBeNull();
+    expect(() => JSON.stringify(tr.result)).not.toThrow();
+
+    const gen = await model.doGenerate({ prompt: "dangle test" });
+    expect(gen.toolCalls).toHaveLength(1);
+    expect(gen.toolCalls[0]?.result).toEqual({ status: "completed" });
+  });
+
+  test("multiple tool_call_updates (in_progress -> completed -> duplicate completed) emit NO duplicate tool-call or tool-result", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_dup_1",
+            _meta: { kiro: { toolName: "web_search" } },
+            status: "pending",
+          },
+        });
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_dup_1",
+            status: "in_progress",
+          },
+        });
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_dup_1",
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "first final" } }],
+          },
+        });
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_dup_1",
+            status: "completed",
+            content: [{ type: "content", content: { type: "text", text: "second duplicate" } }],
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "dup test" });
+    const parts = await collectStream(stream);
+
+    const toolCalls = parts.filter((p) => p.type === "tool-call");
+    const toolResults = parts.filter(
+      (p): p is Extract<KiroStreamPart, { type: "tool-result" }> =>
+        p.type === "tool-result"
+    );
+
+    expect(toolCalls).toHaveLength(1);
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]?.result).toBe("first final");
+  });
+
+  test("non-terminal in_progress update with partial progress content MUST NOT prematurely finalize and swallow subsequent failed terminal result", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_prog_1",
+            _meta: { kiro: { toolName: "web_search" } },
+            status: "pending",
+          },
+        });
+        // Non-terminal progress text while still in_progress
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_prog_1",
+            status: "in_progress",
+            content: [
+              { type: "content", content: { type: "text", text: "Fetching page 1/3..." } },
+            ],
+          },
+        });
+        // Real terminal failure arrives afterwards
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "call_prog_1",
+            status: "failed",
+            content: [
+              { type: "content", content: { type: "text", text: "Error: rate limit exceeded" } },
+            ],
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "progress then fail" });
+    const parts = await collectStream(stream);
+
+    const toolResults = parts.filter(
+      (p): p is Extract<KiroStreamPart, { type: "tool-result" }> =>
+        p.type === "tool-result"
+    );
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]?.isError).toBe(true);
+    expect(toolResults[0]?.result).toBe("Error: rate limit exceeded");
+  });
+
+  test("single tool_call arriving already terminal (status: failed + rawOutput) emits isError: true and real rawOutput in doStream", async () => {
+    const fakeClient = createFakeAcpClient({
+      async prompt(sessionId, _blocks, options) {
+        options?.onUpdate?.({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "call_oneshot_fail",
+            _meta: { kiro: { toolName: "web_search" } },
+            status: "failed",
+            rawOutput: { error: "permission denied" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      },
+    });
+
+    const model = new KiroAcpLanguageModel("kiro/auto", { acpClient: fakeClient });
+    const { stream } = await model.doStream({ prompt: "oneshot fail" });
+    const parts = await collectStream(stream);
+
+    const toolResults = parts.filter(
+      (p): p is Extract<KiroStreamPart, { type: "tool-result" }> =>
+        p.type === "tool-result"
+    );
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]?.isError).toBe(true);
+    expect(toolResults[0]?.result).toEqual({ error: "permission denied" });
+  });
+
+  test("setupOpenCodeV2 -> aisdk.hook('language') emits valid AI SDK v3 stream parts and NEVER emits client-executed tool-calls", async () => {
+    const hookFilters: Array<{ name: string; filter?: { providerID?: string } }> = [];
+    let languageHook: ((event: Record<string, unknown>) => Promise<void> | void) | undefined;
+
+    const mockV2Ctx: OpenCodeV2Context = {
+      location: { directory: process.cwd() },
+      provider: {
+        transform(fn) {
+          const store = new Map<string, Record<string, unknown>>();
+          fn({
+            get: (id) => store.get(id),
+            add: ({ info }) => {
+              store.set(String(info.id), info);
+            },
+            update: (id, updater) => {
+              const entry = store.get(id) ?? {};
+              updater(entry);
+              store.set(id, entry);
+            },
+            models: {
+              update: () => {},
+            },
+          });
+          return {};
+        },
+      },
+      aisdk: {
+        hook(name, handler, filter) {
+          hookFilters.push({ name, filter });
+          if (name === "language") {
+            languageHook = handler;
+          }
+          return {};
+        },
+      },
+    };
+
+    const disposeV2 = await setupOpenCodeV2(mockV2Ctx, {
+      cliPath: MOCK_V3_TOOLS_CLI,
+    });
+
+    try {
+      // Both hooks MUST be strictly scoped to providerID: "kiro"
+      expect(hookFilters.length).toBeGreaterThanOrEqual(2);
+      for (const h of hookFilters) {
+        expect(h.filter?.providerID).toBe(KIRO_PROVIDER_ID);
+      }
+      expect(languageHook).toBeDefined();
+
+      // Obtain v3 LanguageModel adapter via aisdk.hook("language")
+      const event: Record<string, unknown> = { model: { id: "claude-sonnet-4.5" } };
+      await languageHook!(event);
+
+      const v3Model = event.language as {
+        specificationVersion: string;
+        provider: string;
+        modelId: string;
+        doStream: (opts: { prompt: string }) => Promise<{ stream: ReadableStream<Record<string, unknown>> }>;
+        doGenerate: (opts: { prompt: string }) => Promise<{
+          content: Array<Record<string, unknown>>;
+          finishReason: { unified: string; raw: string };
+        }>;
+      };
+
+      expect(v3Model.specificationVersion).toBe("v3");
+      expect(v3Model.provider).toBe("kiro");
+      expect(v3Model.modelId).toBe("claude-sonnet-4.5");
+
+      // Stream end-to-end through mock kiro-cli 3.6.1 web_search fixture
+      const { stream } = await v3Model.doStream({ prompt: "Search OpenCode 2.x" });
+      const v3Parts: Array<Record<string, unknown>> = [];
+      const reader = stream.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        v3Parts.push(value);
+      }
+      reader.releaseLock();
+
+      const types = v3Parts.map((p) => p.type);
+      expect(types[0]).toBe("stream-start");
+      expect(types).toContain("tool-call");
+      expect(types).toContain("tool-result");
+      expect(types).toContain("text-start");
+      expect(types).toContain("text-delta");
+      expect(types).toContain("text-end");
+      expect(types[types.length - 1]).toBe("finish");
+
+      // NEVER emit client-executed tool-calls
+      const v3ToolCalls = v3Parts.filter((p) => p.type === "tool-call");
+      expect(v3ToolCalls).toHaveLength(1);
+      for (const tc of v3ToolCalls) {
+        expect(tc.providerExecuted).toBe(true);
+        expect(tc.dynamic).toBe(true);
+        expect(tc.toolCallId).toBe("call_ws_361");
+        expect(tc.toolName).toBe("web_search");
+        expect(typeof tc.input).toBe("string");
+        expect(JSON.parse(String(tc.input))).toEqual({ query: "OpenCode 2.x AI SDK v3" });
+      }
+
+      const v3ToolResults = v3Parts.filter((p) => p.type === "tool-result");
+      expect(v3ToolResults).toHaveLength(1);
+      expect(v3ToolResults[0]?.toolCallId).toBe("call_ws_361");
+      expect(v3ToolResults[0]?.toolName).toBe("web_search");
+      expect(v3ToolResults[0]?.dynamic).toBe(true);
+      expect(v3ToolResults[0]?.result).toBe("Found OpenCode 2.x AI SDK v3 docs.");
+
+      // Verify reasoning-end is emitted BEFORE tool-call (no dangling open reasoning block during tool execution)
+      const reasoningEndIdx = types.indexOf("reasoning-end");
+      const toolCallIdx = types.indexOf("tool-call");
+      expect(reasoningEndIdx).toBeGreaterThan(-1);
+      expect(reasoningEndIdx).toBeLessThan(toolCallIdx);
+
+      // Verify doGenerate on v3 adapter also emits providerExecuted: true, dynamic: true
+      const gen = await v3Model.doGenerate({ prompt: "Search OpenCode 2.x" });
+      const genToolCalls = gen.content.filter((c) => c.type === "tool-call");
+      const genToolResults = gen.content.filter((c) => c.type === "tool-result");
+      expect(genToolCalls).toHaveLength(1);
+      expect(genToolCalls[0]?.providerExecuted).toBe(true);
+      expect(genToolCalls[0]?.dynamic).toBe(true);
+      expect(genToolCalls[0]?.toolName).toBe("web_search");
+      expect(genToolResults).toHaveLength(1);
+      expect(genToolResults[0]?.dynamic).toBe(true);
+      expect(genToolResults[0]?.toolName).toBe("web_search");
+
+      // Verify foreign model rejected by aisdk.hook("language")
+      await expect(
+        languageHook!({ model: { id: "openai/gpt-4o" } })
+      ).rejects.toThrow(KiroProviderOwnershipError);
+    } finally {
+      await disposeV2();
+    }
+  });
+
+  test("resolveCanonicalToolName priority order: _meta.kiro.toolName > toolName > name > kind > title > kiro_tool", () => {
+    expect(
+      resolveCanonicalToolName({
+        _meta: { kiro: { toolName: "web_search" } },
+        toolName: "other",
+        name: "other2",
+        kind: "search",
+        title: "Searching the web",
+      })
+    ).toBe("web_search");
+    expect(resolveCanonicalToolName({ kind: "search", title: "Searching" })).toBe("search");
+    expect(resolveCanonicalToolName({ title: "Searching" })).toBe("Searching");
+    expect(resolveCanonicalToolName({})).toBe("kiro_tool");
   });
 });

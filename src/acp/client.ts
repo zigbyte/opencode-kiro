@@ -97,6 +97,7 @@ const READ_ONLY_TOOL_KINDS = new Set([
   "list",
   "grep",
   "glob",
+  "web_search",
   "view",
   "find",
   "think",
@@ -142,7 +143,9 @@ function evaluatePermissionPolicy(
       return allow;
     }
   } else if (policy === "allow_read_only") {
-    const kind = params.toolCall?.kind?.toLowerCase().trim();
+    const rawKind: unknown = params.toolCall?.kind;
+    const kind =
+      typeof rawKind === "string" ? rawKind.toLowerCase().trim() : undefined;
     if (kind && READ_ONLY_TOOL_KINDS.has(kind)) {
       const allow = selectOptionByKind(options, ["allow_once"]);
       if (allow) {

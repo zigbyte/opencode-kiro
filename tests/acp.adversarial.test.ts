@@ -1019,6 +1019,325 @@ rl.on("line", async (line) => {
     expect(resp.result?.outcome).toEqual({ outcome: "selected", optionId: "opt_reject" });
   });
 
+  test("allow_read_only boundary: allows read-only kinds (incl. uppercase/whitespace) and denies mutating/exec/compound/empty/missing kinds", async () => {
+    const resultsFile = join(makeTempDir(), "allow-ro-boundary.json");
+    const allowedKinds: Array<string> = [
+      "search",
+      "web_search",
+      "fetch",
+      "read",
+      "list",
+      "grep",
+      "glob",
+      "  SEARCH  ",
+      "\tWeb_Search\n",
+      "  FETCH ",
+      "READ",
+    ];
+    const deniedKinds: Array<string | undefined> = [
+      "write",
+      "edit",
+      "delete",
+      "execute",
+      "shell",
+      "bash",
+      "terminal",
+      "run",
+      "read_write",
+      "search_and_delete",
+      "",
+      "   ",
+      undefined,
+    ];
+
+    const boundaryServer = writeTempScript(
+      "allow-ro-boundary-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const resultsFile = ${JSON.stringify(resultsFile)};
+const cases: Array<{ label: string; kind?: string; expectAllow: boolean }> = [
+  ...${JSON.stringify(allowedKinds)}.map((k: string) => ({ label: JSON.stringify(k), kind: k, expectAllow: true })),
+  ...${JSON.stringify(deniedKinds.map((k) => (k === undefined ? "__MISSING__" : k)))}.map((k: string) => ({
+    label: k === "__MISSING__" ? "<missing>" : JSON.stringify(k),
+    kind: k === "__MISSING__" ? undefined : k,
+    expectAllow: false,
+  })),
+];
+
+const pending = new Map<number, (msg: Record<string, unknown>) => void>();
+let nextId = 1200;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+function ask(method: string, params: Record<string, unknown>) {
+  const id = ++nextId;
+  return new Promise<Record<string, unknown>>((resolve) => {
+    pending.set(id, resolve);
+    send({ jsonrpc: "2.0", id, method, params });
+  });
+}
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (!("method" in msg) && typeof msg.id === "number" && pending.has(msg.id)) {
+    const res = pending.get(msg.id)!;
+    pending.delete(msg.id);
+    res(msg);
+    return;
+  }
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-boundary" } });
+  } else if (msg.method === "session/prompt") {
+    const records: Array<{ label: string; expectAllow: boolean; response: Record<string, unknown> }> = [];
+    for (let i = 0; i < cases.length; i++) {
+      const c = cases[i];
+      const toolCall: Record<string, unknown> = { toolCallId: "tc-" + i, title: "Test " + c.label };
+      if (c.kind !== undefined) {
+        toolCall.kind = c.kind;
+      }
+      const resp = await ask("session/request_permission", {
+        sessionId: "s-boundary",
+        toolCall,
+        options: [
+          { optionId: "opt_allow", name: "Allow Once", kind: "allow_once" },
+          { optionId: "opt_reject", name: "Reject Once", kind: "reject_once" },
+        ],
+      });
+      records.push({ label: c.label, expectAllow: c.expectAllow, response: resp });
+    }
+    writeFileSync(resultsFile, JSON.stringify(records), "utf8");
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`
+    );
+
+    const client = trackClient(
+      new AcpClient({ cliPath: boundaryServer, permissionPolicy: "allow_read_only" })
+    );
+    await client.connect();
+    const s = await client.newSession();
+    await client.prompt(s.sessionId, [{ type: "text", text: "run boundary matrix" }]);
+
+    const records = JSON.parse(readFileSync(resultsFile, "utf8")) as Array<{
+      label: string;
+      expectAllow: boolean;
+      response: { error?: unknown; result?: { outcome?: { outcome: string; optionId?: string } } };
+    }>;
+
+    expect(records.length).toBe(allowedKinds.length + deniedKinds.length);
+    for (const rec of records) {
+      expect(rec.response.error).toBeUndefined();
+      const expectedOption = rec.expectAllow ? "opt_allow" : "opt_reject";
+      expect(rec.response.result?.outcome).toEqual({
+        outcome: "selected",
+        optionId: expectedOption,
+      });
+    }
+  });
+
+  test("allow_read_only with non-string toolCall.kind degrades cleanly to deny instead of -32603 crash", async () => {
+    const resultsFile = join(makeTempDir(), "allow-ro-nonstring.json");
+    const nonStringServer = writeTempScript(
+      "allow-ro-nonstring-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const resultsFile = ${JSON.stringify(resultsFile)};
+const pending = new Map<number, (msg: Record<string, unknown>) => void>();
+let nextId = 1500;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (!("method" in msg) && typeof msg.id === "number" && pending.has(msg.id)) {
+    const res = pending.get(msg.id)!;
+    pending.delete(msg.id);
+    res(msg);
+    return;
+  }
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-nonstring" } });
+  } else if (msg.method === "session/prompt") {
+    const badKinds: unknown[] = [123, ["read"], { kind: "read" }, true];
+    const responses: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < badKinds.length; i++) {
+      const id = ++nextId;
+      const resp = await new Promise<Record<string, unknown>>((resolve) => {
+        pending.set(id, resolve);
+        send({
+          jsonrpc: "2.0",
+          id,
+          method: "session/request_permission",
+          params: {
+            sessionId: "s-nonstring",
+            toolCall: { toolCallId: "tc-bad-" + i, kind: badKinds[i] },
+            options: [
+              { optionId: "opt_allow", name: "Allow", kind: "allow_once" },
+              { optionId: "opt_reject", name: "Reject", kind: "reject_once" },
+            ],
+          },
+        });
+      });
+      responses.push(resp);
+    }
+    writeFileSync(resultsFile, JSON.stringify(responses), "utf8");
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`
+    );
+
+    const client = trackClient(
+      new AcpClient({ cliPath: nonStringServer, permissionPolicy: "allow_read_only" })
+    );
+    await client.connect();
+    const s = await client.newSession();
+    await client.prompt(s.sessionId, [{ type: "text", text: "test non-string kinds" }]);
+
+    const responses = JSON.parse(readFileSync(resultsFile, "utf8")) as Array<{
+      error?: unknown;
+      result?: { outcome?: { outcome: string; optionId?: string } };
+    }>;
+
+    expect(responses).toHaveLength(4);
+    for (const r of responses) {
+      expect(r.error).toBeUndefined();
+      expect(r.result?.outcome).toEqual({ outcome: "selected", optionId: "opt_reject" });
+    }
+  });
+
+  test("session/update preserves _meta.kiro.toolName and nested array content blocks verbatim via AcpClient.prompt onUpdate", async () => {
+    const metaServer = writeTempScript(
+      "meta-content-acp.ts",
+      `
+import * as readline from "node:readline";
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-meta" } });
+  } else if (msg.method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s-meta",
+        _meta: { kiro: { toolName: "web_search", traceId: "tr-1" } },
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-ws-1",
+          title: "Searching web",
+          kind: "search",
+          status: "in_progress",
+          _meta: { kiro: { toolName: "web_search" } },
+          rawInput: { query: "opencode kiro acp" },
+        },
+      },
+    });
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s-meta",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-ws-1",
+          status: "completed",
+          _meta: { kiro: { toolName: "web_search" } },
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Search result snippet 1 🔍",
+              },
+            },
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Search result snippet 2",
+              },
+            },
+          ],
+        },
+      },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: metaServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    const updates: AcpSessionUpdateParams[] = [];
+    const res = await client.prompt(s.sessionId, [{ type: "text", text: "search" }], {
+      onUpdate: (u) => updates.push(u),
+    });
+
+    expect(res.stopReason).toBe("end_turn");
+    expect(updates).toHaveLength(2);
+
+    // 1. tool_call update preserves top-level & update-level _meta.kiro.toolName
+    const first = updates[0] as unknown as Record<string, unknown>;
+    expect((first._meta as Record<string, unknown>)?.kiro).toEqual({
+      toolName: "web_search",
+      traceId: "tr-1",
+    });
+    expect((updates[0].update._meta as Record<string, unknown>)?.kiro).toEqual({
+      toolName: "web_search",
+    });
+
+    // 2. tool_call_update preserves _meta.kiro.toolName AND nested array content verbatim
+    expect((updates[1].update._meta as Record<string, unknown>)?.kiro).toEqual({
+      toolName: "web_search",
+    });
+    expect(updates[1].update.content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "Search result snippet 1 🔍",
+        },
+      },
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "Search result snippet 2",
+        },
+      },
+    ] as unknown as AcpSessionUpdateParams["update"]["content"]);
+  });
+
   test("end-to-end adversarial stdio: split UTF-8 bytes, garbage stdout lines, unsupported client request, and -32601 getUsage", async () => {
     const hostileServer = writeTempScript(
       "hostile-acp.ts",

@@ -605,6 +605,7 @@ var READ_ONLY_TOOL_KINDS = new Set([
   "list",
   "grep",
   "glob",
+  "web_search",
   "view",
   "find",
   "think"
@@ -632,7 +633,8 @@ function evaluatePermissionPolicy(policy, params) {
       return allow;
     }
   } else if (policy === "allow_read_only") {
-    const kind = params.toolCall?.kind?.toLowerCase().trim();
+    const rawKind = params.toolCall?.kind;
+    const kind = typeof rawKind === "string" ? rawKind.toLowerCase().trim() : undefined;
     if (kind && READ_ONLY_TOOL_KINDS.has(kind)) {
       const allow = selectOptionByKind(options, ["allow_once"]);
       if (allow) {
@@ -2383,6 +2385,80 @@ function normalizeUsage(result) {
     ...creditsUsed !== undefined ? { creditsUsed } : {}
   };
 }
+var TERMINAL_TOOL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "error",
+  "cancelled"
+]);
+var ERROR_TOOL_STATUSES = new Set(["failed", "error", "cancelled"]);
+function toNonEmptyString2(value) {
+  if (typeof value !== "string")
+    return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+function isPlainRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function resolveCanonicalToolName(update) {
+  const meta = isPlainRecord(update._meta) ? update._meta : undefined;
+  const kiroMeta = meta && isPlainRecord(meta.kiro) ? meta.kiro : undefined;
+  return toNonEmptyString2(kiroMeta?.toolName) ?? toNonEmptyString2(update.toolName) ?? toNonEmptyString2(update.name) ?? toNonEmptyString2(update.kind) ?? toNonEmptyString2(update.title) ?? "kiro_tool";
+}
+function extractToolContentText(update) {
+  const content = update.content;
+  const texts = [];
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      if (!isPlainRecord(item))
+        continue;
+      if (item.type === "content" && isPlainRecord(item.content)) {
+        const nestedText = toNonEmptyString2(item.content.text);
+        if (nestedText !== null) {
+          texts.push(nestedText);
+        }
+        continue;
+      }
+      if (item.type === "text") {
+        const directText = toNonEmptyString2(item.text);
+        if (directText !== null) {
+          texts.push(directText);
+        }
+      }
+    }
+  } else if (isPlainRecord(content)) {
+    if (content.type === "text") {
+      const directText = toNonEmptyString2(content.text);
+      if (directText !== null) {
+        texts.push(directText);
+      }
+    } else if (content.type === "content" && isPlainRecord(content.content)) {
+      const nestedText = toNonEmptyString2(content.content.text);
+      if (nestedText !== null) {
+        texts.push(nestedText);
+      }
+    }
+  }
+  return texts.length > 0 ? texts.join(`
+`) : null;
+}
+function hasExtractableToolOutput(update) {
+  if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    return true;
+  }
+  return extractToolContentText(update) !== null;
+}
+function extractToolResult(update, status) {
+  if (update.rawOutput !== undefined && update.rawOutput !== null) {
+    return update.rawOutput;
+  }
+  const text = extractToolContentText(update);
+  if (text !== null) {
+    return text;
+  }
+  return { status: status ?? "completed" };
+}
 
 class KiroAcpLanguageModel {
   specificationVersion = "v2";
@@ -2444,23 +2520,40 @@ class KiroAcpLanguageModel {
           }
           case "tool_call":
           case "tool_call_update": {
-            const id = update.toolCallId ?? `tool_${toolCallsById.size + 1}`;
+            const id = toNonEmptyString2(update.toolCallId) ?? `tool_${toolCallsById.size + 1}`;
             const existing = toolCallsById.get(id);
+            const lockedName = existing?.toolName ?? resolveCanonicalToolName(update);
+            const status = toNonEmptyString2(update.status)?.toLowerCase() ?? null;
+            const isTerminal = status !== null && TERMINAL_TOOL_STATUSES.has(status);
+            const hasOutput = hasExtractableToolOutput(update);
+            const isError = status !== null && ERROR_TOOL_STATUSES.has(status) ? true : existing?.isError;
+            let nextResult = existing?.result;
+            if (isTerminal || status === null && hasOutput) {
+              nextResult = extractToolResult(update, status);
+            }
             toolCallsById.set(id, {
               toolCallId: id,
-              toolName: update.title ?? update.kind ?? existing?.toolName ?? "tool",
-              args: update.rawInput !== undefined ? update.rawInput : existing?.args ?? {},
-              status: update.status ?? existing?.status
+              toolName: lockedName,
+              args: existing !== undefined ? existing.args : update.rawInput !== undefined ? update.rawInput : {},
+              status: toNonEmptyString2(update.status) ?? existing?.status,
+              providerExecuted: true,
+              dynamic: true,
+              ...nextResult !== undefined ? { result: nextResult } : {},
+              ...isError ? { isError: true } : {}
             });
             break;
           }
         }
       }
     });
+    const finalizedToolCalls = Array.from(toolCallsById.values()).map((tc) => tc.result !== undefined ? tc : {
+      ...tc,
+      result: { status: tc.status ?? "completed" }
+    });
     return {
       text,
       reasoning,
-      toolCalls: Array.from(toolCallsById.values()),
+      toolCalls: finalizedToolCalls,
       finishReason: mapAcpStopReason(promptResult.stopReason),
       usage: normalizeUsage(promptResult),
       rawResponse: {
@@ -2538,6 +2631,7 @@ class KiroAcpLanguageModel {
             await this.acpClient.setModel(session.sessionId, this.modelId);
             this.onModelActive?.(this.modelId);
             const blocks = convertPromptToAcpBlocks(options.prompt, options.system);
+            const toolState = new Map;
             const result = await this.acpClient.prompt(session.sessionId, blocks, {
               signal: internalAbort.signal,
               onUpdate: (params) => {
@@ -2567,29 +2661,44 @@ class KiroAcpLanguageModel {
                     }
                     break;
                   }
-                  case "tool_call": {
-                    safeEnqueue({
-                      type: "tool-call",
-                      toolCallId: update.toolCallId ?? "tool_call",
-                      toolName: update.title ?? update.kind ?? "tool",
-                      args: update.rawInput ?? {}
-                    });
-                    break;
-                  }
+                  case "tool_call":
                   case "tool_call_update": {
-                    if (update.rawOutput !== undefined || update.status === "completed") {
-                      safeEnqueue({
-                        type: "tool-result",
-                        toolCallId: update.toolCallId ?? "tool_call",
-                        toolName: update.title ?? update.kind,
-                        result: update.rawOutput ?? null
-                      });
-                    } else if (update.rawInput !== undefined) {
+                    const id = toNonEmptyString2(update.toolCallId) ?? `tool_${toolState.size + 1}`;
+                    let state = toolState.get(id);
+                    if (!state) {
+                      state = {
+                        toolName: resolveCanonicalToolName(update),
+                        emittedCall: false,
+                        emittedFinalResult: false
+                      };
+                      toolState.set(id, state);
+                    }
+                    if (!state.emittedCall) {
+                      state.emittedCall = true;
                       safeEnqueue({
                         type: "tool-call",
-                        toolCallId: update.toolCallId ?? "tool_call",
-                        toolName: update.title ?? update.kind ?? "tool",
-                        args: update.rawInput
+                        toolCallId: id,
+                        toolName: state.toolName,
+                        args: update.rawInput ?? {},
+                        providerExecuted: true,
+                        dynamic: true
+                      });
+                    }
+                    const status = toNonEmptyString2(update.status)?.toLowerCase() ?? null;
+                    const isTerminal = status !== null && TERMINAL_TOOL_STATUSES.has(status);
+                    const hasOutput = hasExtractableToolOutput(update);
+                    const shouldFinalize = isTerminal || update.sessionUpdate === "tool_call_update" && status === null && hasOutput;
+                    if (shouldFinalize && !state.emittedFinalResult) {
+                      const isError = status !== null && ERROR_TOOL_STATUSES.has(status);
+                      const extracted = extractToolResult(update, status);
+                      state.emittedFinalResult = true;
+                      safeEnqueue({
+                        type: "tool-result",
+                        toolCallId: id,
+                        toolName: state.toolName,
+                        result: extracted,
+                        ...isError ? { isError: true } : {},
+                        dynamic: true
                       });
                     }
                     break;
@@ -2597,6 +2706,18 @@ class KiroAcpLanguageModel {
                 }
               }
             });
+            for (const [toolCallId, state] of toolState.entries()) {
+              if (state.emittedCall && !state.emittedFinalResult) {
+                state.emittedFinalResult = true;
+                safeEnqueue({
+                  type: "tool-result",
+                  toolCallId,
+                  toolName: state.toolName,
+                  result: { status: "completed" },
+                  dynamic: true
+                });
+              }
+            }
             safeEnqueue({
               type: "finish",
               finishReason: mapAcpStopReason(result.stopReason),
@@ -2709,8 +2830,8 @@ function mapFinishReasonV3(reason) {
   }
 }
 function toV3Usage(usage) {
-  const inputTotal = usage?.promptTokens ?? 0;
-  const outputTotal = usage?.completionTokens ?? 0;
+  const inputTotal = usage?.inputTokens ?? usage?.promptTokens ?? 0;
+  const outputTotal = usage?.outputTokens ?? usage?.completionTokens ?? 0;
   return {
     inputTokens: {
       total: inputTotal,
@@ -2724,6 +2845,26 @@ function toV3Usage(usage) {
       reasoning: 0
     }
   };
+}
+function safeJsonStringify2(value) {
+  const seen = new WeakSet;
+  try {
+    const json = JSON.stringify(value, (_key, val) => {
+      if (typeof val === "bigint") {
+        return val.toString();
+      }
+      if (typeof val === "object" && val !== null) {
+        if (seen.has(val)) {
+          return "[Circular]";
+        }
+        seen.add(val);
+      }
+      return val;
+    });
+    return json ?? "{}";
+  } catch {
+    return "{}";
+  }
 }
 function createLanguageModelV3Adapter(model) {
   return {
@@ -2746,9 +2887,19 @@ function createLanguageModelV3Adapter(model) {
       for (const tc of result.toolCalls) {
         content.push({
           type: "tool-call",
+          providerExecuted: true,
+          dynamic: true,
           toolCallId: tc.toolCallId,
           toolName: tc.toolName,
-          input: JSON.stringify(tc.args ?? {})
+          input: safeJsonStringify2(tc.args ?? {})
+        });
+        content.push({
+          type: "tool-result",
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          result: tc.result ?? { ok: true },
+          ...tc.isError ? { isError: true } : {},
+          dynamic: true
         });
       }
       return {
@@ -2763,12 +2914,24 @@ function createLanguageModelV3Adapter(model) {
         prompt: options.prompt,
         abortSignal: options.abortSignal
       });
-      const textId = `kiro-text-${Date.now()}`;
-      const reasoningId = `kiro-reasoning-${Date.now()}`;
-      let textStarted = false;
-      let reasoningStarted = false;
+      let textSeq = 0;
+      let reasoningSeq = 0;
+      let currentTextId = null;
+      let currentReasoningId = null;
       const v3Stream = new ReadableStream({
         async start(controller) {
+          const closeReasoning = () => {
+            if (currentReasoningId) {
+              controller.enqueue({ type: "reasoning-end", id: currentReasoningId });
+              currentReasoningId = null;
+            }
+          };
+          const closeText = () => {
+            if (currentTextId) {
+              controller.enqueue({ type: "text-end", id: currentTextId });
+              currentTextId = null;
+            }
+          };
           controller.enqueue({ type: "stream-start", warnings: [] });
           const reader = v2Stream.getReader();
           try {
@@ -2777,47 +2940,56 @@ function createLanguageModelV3Adapter(model) {
               if (done)
                 break;
               if (value.type === "reasoning-delta") {
-                if (!reasoningStarted) {
-                  reasoningStarted = true;
-                  controller.enqueue({ type: "reasoning-start", id: reasoningId });
+                closeText();
+                if (!currentReasoningId) {
+                  currentReasoningId = `kiro-reasoning-${++reasoningSeq}`;
+                  controller.enqueue({ type: "reasoning-start", id: currentReasoningId });
                 }
                 controller.enqueue({
                   type: "reasoning-delta",
-                  id: reasoningId,
+                  id: currentReasoningId,
                   delta: value.textDelta
                 });
               } else if (value.type === "text-delta") {
-                if (reasoningStarted) {
-                  reasoningStarted = false;
-                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
-                }
-                if (!textStarted) {
-                  textStarted = true;
-                  controller.enqueue({ type: "text-start", id: textId });
+                closeReasoning();
+                if (!currentTextId) {
+                  currentTextId = `kiro-text-${++textSeq}`;
+                  controller.enqueue({ type: "text-start", id: currentTextId });
                 }
                 controller.enqueue({
                   type: "text-delta",
-                  id: textId,
+                  id: currentTextId,
                   delta: value.textDelta
                 });
               } else if (value.type === "tool-call") {
+                closeReasoning();
+                closeText();
                 controller.enqueue({
                   type: "tool-call",
+                  providerExecuted: true,
+                  dynamic: true,
                   toolCallId: value.toolCallId,
                   toolName: value.toolName,
-                  input: JSON.stringify(value.args ?? {})
+                  input: safeJsonStringify2(value.args ?? {})
+                });
+              } else if (value.type === "tool-result") {
+                closeReasoning();
+                closeText();
+                controller.enqueue({
+                  type: "tool-result",
+                  toolCallId: value.toolCallId,
+                  toolName: value.toolName,
+                  result: value.result ?? { ok: true },
+                  ...value.isError ? { isError: true } : {},
+                  dynamic: true
                 });
               } else if (value.type === "error") {
+                closeReasoning();
+                closeText();
                 controller.enqueue({ type: "error", error: value.error });
               } else if (value.type === "finish") {
-                if (reasoningStarted) {
-                  reasoningStarted = false;
-                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
-                }
-                if (textStarted) {
-                  textStarted = false;
-                  controller.enqueue({ type: "text-end", id: textId });
-                }
+                closeReasoning();
+                closeText();
                 controller.enqueue({
                   type: "finish",
                   finishReason: mapFinishReasonV3(value.finishReason),
@@ -2827,7 +2999,9 @@ function createLanguageModelV3Adapter(model) {
             }
           } finally {
             reader.releaseLock();
-            controller.close();
+            try {
+              controller.close();
+            } catch {}
           }
         },
         cancel() {
@@ -2844,7 +3018,8 @@ async function setupOpenCodeV2(ctx, options = {}) {
   const effectiveOptions = {
     ...options,
     cliPath,
-    cwd
+    cwd,
+    permissionPolicy: ctx.options?.permissionPolicy ?? options.permissionPolicy ?? "allow_read_only"
   };
   const acpClient = new AcpClient(effectiveOptions);
   const authManager = new KiroAuthManager(effectiveOptions);

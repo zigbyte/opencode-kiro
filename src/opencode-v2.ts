@@ -18,7 +18,7 @@ import { KiroModelDiscovery } from "./discovery/index.ts";
 import {
   KiroAcpLanguageModel,
   createKiroProvider,
-  type KiroDoGenerateOptions,
+  type KiroCallOptions,
   type KiroPromptMessage,
 } from "./provider/index.ts";
 import {
@@ -111,9 +111,14 @@ function mapFinishReasonV3(reason: string): { unified: string; raw: string } {
   }
 }
 
-function toV3Usage(usage?: { promptTokens?: number; completionTokens?: number }) {
-  const inputTotal = usage?.promptTokens ?? 0;
-  const outputTotal = usage?.completionTokens ?? 0;
+function toV3Usage(usage?: {
+  inputTokens?: number;
+  outputTokens?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+}) {
+  const inputTotal = usage?.inputTokens ?? usage?.promptTokens ?? 0;
+  const outputTotal = usage?.outputTokens ?? usage?.completionTokens ?? 0;
   return {
     inputTokens: {
       total: inputTotal,
@@ -127,6 +132,27 @@ function toV3Usage(usage?: { promptTokens?: number; completionTokens?: number })
       reasoning: 0,
     },
   };
+}
+
+function safeJsonStringify(value: unknown): string {
+  const seen = new WeakSet<object>();
+  try {
+    const json = JSON.stringify(value, (_key, val: unknown) => {
+      if (typeof val === "bigint") {
+        return val.toString();
+      }
+      if (typeof val === "object" && val !== null) {
+        if (seen.has(val)) {
+          return "[Circular]";
+        }
+        seen.add(val);
+      }
+      return val;
+    });
+    return json ?? "{}";
+  } catch {
+    return "{}";
+  }
 }
 
 /**
@@ -147,7 +173,7 @@ function createLanguageModelV3Adapter(model: KiroAcpLanguageModel) {
       const result = await model.doGenerate({
         prompt: options.prompt,
         abortSignal: options.abortSignal,
-      } satisfies KiroDoGenerateOptions);
+      } satisfies KiroCallOptions);
 
       const content: Array<Record<string, unknown>> = [];
       if (result.reasoning) {
@@ -159,9 +185,19 @@ function createLanguageModelV3Adapter(model: KiroAcpLanguageModel) {
       for (const tc of result.toolCalls) {
         content.push({
           type: "tool-call",
+          providerExecuted: true,
+          dynamic: true,
           toolCallId: tc.toolCallId,
           toolName: tc.toolName,
-          input: JSON.stringify(tc.args ?? {}),
+          input: safeJsonStringify(tc.args ?? {}),
+        });
+        content.push({
+          type: "tool-result",
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          result: tc.result ?? { ok: true },
+          ...(tc.isError ? { isError: true } : {}),
+          dynamic: true,
         });
       }
 
@@ -182,13 +218,27 @@ function createLanguageModelV3Adapter(model: KiroAcpLanguageModel) {
         abortSignal: options.abortSignal,
       });
 
-      const textId = `kiro-text-${Date.now()}`;
-      const reasoningId = `kiro-reasoning-${Date.now()}`;
-      let textStarted = false;
-      let reasoningStarted = false;
+      let textSeq = 0;
+      let reasoningSeq = 0;
+      let currentTextId: string | null = null;
+      let currentReasoningId: string | null = null;
 
       const v3Stream = new ReadableStream<Record<string, unknown>>({
         async start(controller) {
+          const closeReasoning = (): void => {
+            if (currentReasoningId) {
+              controller.enqueue({ type: "reasoning-end", id: currentReasoningId });
+              currentReasoningId = null;
+            }
+          };
+
+          const closeText = (): void => {
+            if (currentTextId) {
+              controller.enqueue({ type: "text-end", id: currentTextId });
+              currentTextId = null;
+            }
+          };
+
           controller.enqueue({ type: "stream-start", warnings: [] });
           const reader = v2Stream.getReader();
           try {
@@ -197,47 +247,56 @@ function createLanguageModelV3Adapter(model: KiroAcpLanguageModel) {
               if (done) break;
 
               if (value.type === "reasoning-delta") {
-                if (!reasoningStarted) {
-                  reasoningStarted = true;
-                  controller.enqueue({ type: "reasoning-start", id: reasoningId });
+                closeText();
+                if (!currentReasoningId) {
+                  currentReasoningId = `kiro-reasoning-${++reasoningSeq}`;
+                  controller.enqueue({ type: "reasoning-start", id: currentReasoningId });
                 }
                 controller.enqueue({
                   type: "reasoning-delta",
-                  id: reasoningId,
+                  id: currentReasoningId,
                   delta: value.textDelta,
                 });
               } else if (value.type === "text-delta") {
-                if (reasoningStarted) {
-                  reasoningStarted = false;
-                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
-                }
-                if (!textStarted) {
-                  textStarted = true;
-                  controller.enqueue({ type: "text-start", id: textId });
+                closeReasoning();
+                if (!currentTextId) {
+                  currentTextId = `kiro-text-${++textSeq}`;
+                  controller.enqueue({ type: "text-start", id: currentTextId });
                 }
                 controller.enqueue({
                   type: "text-delta",
-                  id: textId,
+                  id: currentTextId,
                   delta: value.textDelta,
                 });
               } else if (value.type === "tool-call") {
+                closeReasoning();
+                closeText();
                 controller.enqueue({
                   type: "tool-call",
+                  providerExecuted: true,
+                  dynamic: true,
                   toolCallId: value.toolCallId,
                   toolName: value.toolName,
-                  input: JSON.stringify(value.args ?? {}),
+                  input: safeJsonStringify(value.args ?? {}),
+                });
+              } else if (value.type === "tool-result") {
+                closeReasoning();
+                closeText();
+                controller.enqueue({
+                  type: "tool-result",
+                  toolCallId: value.toolCallId,
+                  toolName: value.toolName,
+                  result: value.result ?? { ok: true },
+                  ...(value.isError ? { isError: true } : {}),
+                  dynamic: true,
                 });
               } else if (value.type === "error") {
+                closeReasoning();
+                closeText();
                 controller.enqueue({ type: "error", error: value.error });
               } else if (value.type === "finish") {
-                if (reasoningStarted) {
-                  reasoningStarted = false;
-                  controller.enqueue({ type: "reasoning-end", id: reasoningId });
-                }
-                if (textStarted) {
-                  textStarted = false;
-                  controller.enqueue({ type: "text-end", id: textId });
-                }
+                closeReasoning();
+                closeText();
                 controller.enqueue({
                   type: "finish",
                   finishReason: mapFinishReasonV3(value.finishReason),
@@ -247,7 +306,11 @@ function createLanguageModelV3Adapter(model: KiroAcpLanguageModel) {
             }
           } finally {
             reader.releaseLock();
-            controller.close();
+            try {
+              controller.close();
+            } catch {
+              // Stream already closed or cancelled
+            }
           }
         },
         cancel() {
@@ -277,6 +340,10 @@ export async function setupOpenCodeV2(
     ...options,
     cliPath,
     cwd,
+    permissionPolicy:
+      (ctx.options?.permissionPolicy as KiroPluginOptions["permissionPolicy"]) ??
+      options.permissionPolicy ??
+      "allow_read_only",
   };
 
   const acpClient = new AcpClient(effectiveOptions);

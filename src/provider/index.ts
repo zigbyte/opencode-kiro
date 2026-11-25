@@ -15,6 +15,7 @@ export {
   createKiroProvider,
   convertPromptToAcpBlocks,
   mapAcpStopReason,
+  resolveCanonicalToolName,
   type KiroPromptPart,
   type KiroPromptMessage,
   type KiroCallOptions,

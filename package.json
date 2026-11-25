@@ -1,0 +1,61 @@
+{
+  "name": "opencode-kiro",
+  "version": "1.0.0",
+  "description": "ACP-compliant Kiro provider plugin for OpenCode 2.x with kiro-cli login auth, model discovery, strict provider ownership, and TUI credits display",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "kiro",
+    "kiro-cli",
+    "acp",
+    "agent-client-protocol",
+    "tui"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./tui": {
+      "types": "./src/tui.tsx",
+      "default": "./src/tui.tsx"
+    },
+    "./rpc": {
+      "types": "./src/rpc.ts",
+      "default": "./src/rpc.ts"
+    },
+    "./provider": {
+      "types": "./src/provider/index.ts",
+      "default": "./src/provider/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "verify": "bun run typecheck && bun test"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "bun": ">=1.2.0"
+  },
+  "opencode": {
+    "apiVersion": "2.x",
+    "surfaces": ["server", "tui"],
+    "provider": "kiro",
+    "protocol": "acp"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

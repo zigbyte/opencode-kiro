@@ -13,28 +13,30 @@
     "agent-client-protocol",
     "tui"
   ],
+  "main": "./dist/index.js",
   "exports": {
     ".": {
       "types": "./src/index.ts",
-      "default": "./src/index.ts"
+      "default": "./dist/index.js"
     },
     "./tui": {
       "types": "./src/tui.tsx",
-      "default": "./src/tui.tsx"
+      "default": "./dist/tui.js"
     },
     "./rpc": {
       "types": "./src/rpc.ts",
-      "default": "./src/rpc.ts"
+      "default": "./dist/rpc.js"
     },
     "./provider": {
       "types": "./src/provider/index.ts",
-      "default": "./src/provider/index.ts"
+      "default": "./dist/provider.js"
     }
   },
   "scripts": {
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm && bun build src/tui.tsx --outfile dist/tui.js --target node --format esm && bun build src/rpc.ts --outfile dist/rpc.js --target node --format esm && bun build src/provider/index.ts --outfile dist/provider.js --target node --format esm",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "verify": "bun run typecheck && bun test"
+    "verify": "bun run build && bun test"
   },
   "engines": {
     "node": ">=20.0.0",

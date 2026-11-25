@@ -33,10 +33,10 @@
     }
   },
   "scripts": {
-    "build": "bun build src/index.ts --outfile dist/index.js --target node --format esm && bun build src/tui.tsx --outfile dist/tui.js --target node --format esm && bun build src/rpc.ts --outfile dist/rpc.js --target node --format esm && bun build src/provider/index.ts --outfile dist/provider.js --target node --format esm",
+    "bundle": "bun build src/index.ts --outfile dist/index.js --target node --format esm && bun build src/tui.tsx --outfile dist/tui.js --target node --format esm && bun build src/rpc.ts --outfile dist/rpc.js --target node --format esm && bun build src/provider/index.ts --outfile dist/provider.js --target node --format esm",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "verify": "bun run build && bun test"
+    "verify": "bun run bundle && bun test"
   },
   "engines": {
     "node": ">=20.0.0",

@@ -65,7 +65,111 @@ export type TuiPlugin = (
 
 export interface TuiPluginModule {
   id: string;
+  setup: (ctx: unknown, options?: TuiPluginOptions) => Promise<(() => void) | void> | (() => void) | void;
   tui: TuiPlugin;
+}
+
+interface OpenCodeV2TuiContext {
+  options?: Readonly<Record<string, unknown>>;
+  ui?: {
+    toast?: {
+      show?: (opts: {
+        title?: string;
+        message: string;
+        variant?: "info" | "success" | "warning" | "error";
+      }) => void;
+    };
+    model?: {
+      current?: () => { providerID: string; modelID: string } | undefined;
+    };
+    slot?: (claim: Record<string, unknown>) => () => void;
+  };
+  data?: {
+    on?: (type: string, handler: (event: unknown) => void) => () => void;
+  };
+  keymap?: {
+    layer?: (factory: () => Record<string, unknown>) => void;
+  };
+}
+
+function isOpenCodeV2TuiContext(ctx: unknown): ctx is OpenCodeV2TuiContext {
+  if (!ctx || typeof ctx !== "object") return false;
+  const candidate = ctx as OpenCodeV2TuiContext;
+  return (
+    typeof candidate.ui?.slot === "function" ||
+    typeof candidate.ui?.toast?.show === "function" ||
+    typeof candidate.data?.on === "function"
+  );
+}
+
+/**
+ * Native OpenCode 2.3+ V2 TUI plugin setup (`@opencode/plugin/tui` `Definition`).
+ */
+function setupOpenCodeV2Tui(ctx: OpenCodeV2TuiContext): () => void {
+  const disposers: Array<() => void> = [];
+  let activeModel: string | null = null;
+
+  const updateActiveModel = () => {
+    try {
+      const current = ctx.ui?.model?.current?.();
+      if (current?.providerID === "kiro") {
+        activeModel = current.modelID;
+      }
+    } catch {
+      // Ignore reactive read errors outside Solid tracking scopes.
+    }
+  };
+
+  updateActiveModel();
+
+  if (typeof ctx.data?.on === "function") {
+    try {
+      const unsub = ctx.data.on("session.status", () => {
+        updateActiveModel();
+      });
+      if (typeof unsub === "function") {
+        disposers.push(unsub);
+      }
+    } catch {
+      // Ignore if event type is unavailable in host build.
+    }
+  }
+
+  if (typeof ctx.keymap?.layer === "function") {
+    try {
+      ctx.keymap.layer(() => ({
+        commands: [
+          {
+            id: "opencode-kiro.status",
+            title: "Kiro: Show Status & Credits",
+            category: "Kiro",
+            onSelect: () => {
+              updateActiveModel();
+              ctx.ui?.toast?.show?.({
+                title: "Kiro (ACP)",
+                message: activeModel
+                  ? `Active model: kiro/${activeModel} (auth managed by kiro-cli)`
+                  : "Kiro provider ready via kiro-cli ACP. Select any kiro/* model.",
+                variant: "info",
+              });
+            },
+          },
+        ],
+      }));
+    } catch {
+      // Ignore if host keymap schema differs.
+    }
+  }
+
+  return () => {
+    for (const dispose of disposers.splice(0)) {
+      try {
+        dispose();
+      } catch {
+        // Ignore cleanup errors on teardown.
+      }
+    }
+  };
 }
 
 /**
@@ -156,14 +260,24 @@ export function createKiroTuiPlugin(
     };
   };
 
+  const setup: TuiPluginModule["setup"] = (ctx, options) => {
+    if (isOpenCodeV2TuiContext(ctx)) {
+      return setupOpenCodeV2Tui(ctx);
+    }
+    const handle = tui(ctx as TuiPluginApi, options);
+    return handle.dispose;
+  };
+
   return {
     id: PLUGIN_ID,
+    setup,
     tui,
   };
 }
 
 const kiroTuiPlugin: TuiPluginModule = createKiroTuiPlugin();
 
+export const setup: TuiPluginModule["setup"] = kiroTuiPlugin.setup;
 export const tui: TuiPlugin = kiroTuiPlugin.tui;
 
 export default kiroTuiPlugin;

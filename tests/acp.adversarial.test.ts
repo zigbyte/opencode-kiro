@@ -1515,3 +1515,453 @@ process.exit(0);
     expect(receivedArgs).toEqual([maliciousArg, "acp"]);
   });
 });
+
+// ===========================================================================
+// 6. Error Data Surfacing & Transient Throttle Retry Attacks
+// ===========================================================================
+
+describe("Error Data Surfacing & Transient Throttle Retry Attacks", () => {
+  test("wrapError() surfaces string err.data, object { message } err.data, and truncates oversized err.data (>500 chars)", async () => {
+    const oversizedString = "X".repeat(1200);
+    const oversizedObjMsg = "Y".repeat(900);
+
+    const errServer = writeTempScript(
+      "error-data-acp.ts",
+      `
+import * as readline from "node:readline";
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-err" } });
+  } else if (msg.method === "session/prompt") {
+    const mode = (msg.params?.prompt?.[0]?.text ?? "") as string;
+    if (mode === "str") {
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32603, message: "Internal error", data: "Upstream validation failure: bad schema" },
+      });
+    } else if (mode === "obj") {
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32603, message: "Internal error", data: { message: "Model quota exhausted on region us-east-1" } },
+      });
+    } else if (mode === "oversized_str") {
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32603, message: "Internal error", data: ${JSON.stringify(oversizedString)} },
+      });
+    } else if (mode === "oversized_obj") {
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32603, message: "Internal error", data: { message: ${JSON.stringify(oversizedObjMsg)} } },
+      });
+    }
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: errServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    // 1. String err.data
+    let caught: unknown;
+    try {
+      await client.prompt(s.sessionId, [{ type: "text", text: "str" }]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AcpTransportError);
+    expect((caught as AcpTransportError).message).toContain(
+      "Upstream validation failure: bad schema"
+    );
+    expect((caught as AcpTransportError).data).toBe("Upstream validation failure: bad schema");
+
+    // 2. Object { message } err.data
+    caught = undefined;
+    try {
+      await client.prompt(s.sessionId, [{ type: "text", text: "obj" }]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AcpTransportError);
+    expect((caught as AcpTransportError).message).toContain(
+      "Model quota exhausted on region us-east-1"
+    );
+    expect((caught as AcpTransportError).data).toEqual({
+      message: "Model quota exhausted on region us-east-1",
+    });
+
+    // 3. Oversized string err.data (>500 chars) truncated cleanly
+    caught = undefined;
+    try {
+      await client.prompt(s.sessionId, [{ type: "text", text: "oversized_str" }]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AcpTransportError);
+    const overStrMsg = (caught as AcpTransportError).message;
+    expect(overStrMsg).toContain(`${"X".repeat(500)}...`);
+    expect(overStrMsg).not.toContain("X".repeat(501));
+    expect((caught as AcpTransportError).data).toBe(oversizedString);
+
+    // 4. Oversized object { message } err.data (>500 chars) truncated cleanly
+    caught = undefined;
+    try {
+      await client.prompt(s.sessionId, [{ type: "text", text: "oversized_obj" }]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AcpTransportError);
+    const overObjMsg = (caught as AcpTransportError).message;
+    expect(overObjMsg).toContain(`${"Y".repeat(500)}...`);
+    expect(overObjMsg).not.toContain("Y".repeat(501));
+  });
+
+  test("transient throttle (-32603) retries and succeeds when no agent_message_chunk was emitted yet", async () => {
+    const attemptsFile = join(makeTempDir(), "throttle-attempts.json");
+    const throttleServer = writeTempScript(
+      "throttle-retry-ok-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const attemptsFile = ${JSON.stringify(attemptsFile)};
+let attempts = 0;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-throttle-ok" } });
+  } else if (msg.method === "session/prompt") {
+    attempts += 1;
+    writeFileSync(attemptsFile, JSON.stringify({ attempts }), "utf8");
+    if (attempts === 1) {
+      // Thought chunk (NOT agent_message_chunk) before throttling is still safe to retry
+      send({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "s-throttle-ok",
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "Thinking..." },
+          },
+        },
+      });
+      send({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: {
+          code: -32603,
+          message: "Internal error",
+          data: "ThrottlingException: The request was throttled by the service. Please try again.",
+        },
+      });
+      return;
+    }
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s-throttle-ok",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Recovered after throttle!" },
+        },
+      },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: throttleServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    const chunks: string[] = [];
+    const result = await client.prompt(
+      s.sessionId,
+      [{ type: "text", text: "retry me" }],
+      {
+        onUpdate: (u) => {
+          if (u.update.sessionUpdate === "agent_message_chunk" && u.update.content?.text) {
+            chunks.push(u.update.content.text);
+          }
+        },
+      }
+    );
+
+    expect(result.stopReason).toBe("end_turn");
+    expect(chunks).toEqual(["Recovered after throttle!"]);
+    const state = JSON.parse(readFileSync(attemptsFile, "utf8")) as { attempts: number };
+    expect(state.attempts).toBe(2);
+  }, 10_000);
+
+  test("MUST NOT retry throttle error if agent_message_chunk was ALREADY emitted (no duplicate assistant text)", async () => {
+    const attemptsFile = join(makeTempDir(), "throttle-no-dup.json");
+    const partialServer = writeTempScript(
+      "throttle-after-chunk-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const attemptsFile = ${JSON.stringify(attemptsFile)};
+let attempts = 0;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-partial" } });
+  } else if (msg.method === "session/prompt") {
+    attempts += 1;
+    writeFileSync(attemptsFile, JSON.stringify({ attempts }), "utf8");
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s-partial",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Partial streamed output" },
+        },
+      },
+    });
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: "The request was throttled by the service",
+      },
+    });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: partialServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    const chunks: string[] = [];
+    const startedAt = Date.now();
+    await expect(
+      client.prompt(s.sessionId, [{ type: "text", text: "partial then throttle" }], {
+        onUpdate: (u) => {
+          if (u.update.sessionUpdate === "agent_message_chunk" && u.update.content?.text) {
+            chunks.push(u.update.content.text);
+          }
+        },
+      })
+    ).rejects.toThrow(/throttled by the service/i);
+    const elapsedMs = Date.now() - startedAt;
+
+    // Must fail immediately without sleeping 2000ms
+    expect(elapsedMs).toBeLessThan(1_000);
+    // Must not duplicate assistant text
+    expect(chunks).toEqual(["Partial streamed output"]);
+    const state = JSON.parse(readFileSync(attemptsFile, "utf8")) as { attempts: number };
+    expect(state.attempts).toBe(1);
+  });
+
+  test("MUST NOT retry non-throttle -32603 internal errors (fails immediately without backoff)", async () => {
+    const attemptsFile = join(makeTempDir(), "non-throttle-attempts.json");
+    const nonThrottleServer = writeTempScript(
+      "non-throttle-32603-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const attemptsFile = ${JSON.stringify(attemptsFile)};
+let attempts = 0;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-non-throttle" } });
+  } else if (msg.method === "session/prompt") {
+    attempts += 1;
+    writeFileSync(attemptsFile, JSON.stringify({ attempts }), "utf8");
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: "Unexpected null pointer in backend handler",
+      },
+    });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: nonThrottleServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    const startedAt = Date.now();
+    await expect(
+      client.prompt(s.sessionId, [{ type: "text", text: "fail fast" }])
+    ).rejects.toThrow(/Unexpected null pointer in backend handler/);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(1_000);
+    const state = JSON.parse(readFileSync(attemptsFile, "utf8")) as { attempts: number };
+    expect(state.attempts).toBe(1);
+  });
+
+  test("AbortSignal firing during throttle backoff sleep cancels promptly (never hangs 2s/5s)", async () => {
+    const attemptsFile = join(makeTempDir(), "abort-backoff-attempts.json");
+    const throttleServer = writeTempScript(
+      "abort-during-backoff-acp.ts",
+      `
+import { writeFileSync } from "node:fs";
+import * as readline from "node:readline";
+
+const attemptsFile = ${JSON.stringify(attemptsFile)};
+let attempts = 0;
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-abort-backoff" } });
+  } else if (msg.method === "session/prompt") {
+    attempts += 1;
+    writeFileSync(attemptsFile, JSON.stringify({ attempts }), "utf8");
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: "The request was throttled by the service",
+      },
+    });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: throttleServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    const controller = new AbortController();
+    setTimeout(() => controller.abort("cancel-during-backoff"), 80);
+
+    const startedAt = Date.now();
+    await expect(
+      client.prompt(s.sessionId, [{ type: "text", text: "abort backoff" }], {
+        signal: controller.signal,
+      })
+    ).rejects.toThrow(AcpTransportError);
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(800);
+    const state = JSON.parse(readFileSync(attemptsFile, "utf8")) as { attempts: number };
+    expect(state.attempts).toBe(1);
+  });
+
+  test("dispose() during throttle backoff sleep cancels prompt promptly instead of hanging 2s/5s", async () => {
+    const throttleServer = writeTempScript(
+      "dispose-during-backoff-acp.ts",
+      `
+import * as readline from "node:readline";
+
+function send(msg: Record<string, unknown>) {
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+}
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const msg = JSON.parse(trimmed);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s-dispose-backoff" } });
+  } else if (msg.method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: {
+        code: -32603,
+        message: "Internal error",
+        data: "The request was throttled by the service",
+      },
+    });
+  }
+});
+`
+    );
+
+    const client = trackClient(new AcpClient({ cliPath: throttleServer }));
+    await client.connect();
+    const s = await client.newSession();
+
+    setTimeout(() => {
+      void client.dispose();
+    }, 80);
+
+    const startedAt = Date.now();
+    await expect(
+      client.prompt(s.sessionId, [{ type: "text", text: "dispose during backoff" }])
+    ).rejects.toThrow(AcpTransportError);
+    const elapsedMs = Date.now() - startedAt;
+
+    // BUG PROBE: sleepAbortable() is not linked to client.dispose(), so prompt()
+    // hangs for the full 2000ms backoff even after client.dispose() is called!
+    expect(elapsedMs).toBeLessThan(800);
+  });
+});

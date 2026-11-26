@@ -801,7 +801,7 @@ function isOpenCodeV2TuiContext(ctx) {
   if (!ctx || typeof ctx !== "object")
     return false;
   const candidate = ctx;
-  return typeof candidate.ui?.slot === "function" || typeof candidate.ui?.toast?.show === "function" || typeof candidate.data?.on === "function";
+  return typeof candidate.ui?.slot === "function" || typeof candidate.ui?.toast?.show === "function" || typeof candidate.ui?.model?.current === "function" || typeof candidate.data?.on === "function" || typeof candidate.keymap?.layer === "function";
 }
 function setupOpenCodeV2Tui(ctx) {
   const disposers = [];
@@ -809,8 +809,10 @@ function setupOpenCodeV2Tui(ctx) {
   const updateActiveModel = () => {
     try {
       const current = ctx.ui?.model?.current?.();
-      if (current?.providerID === "kiro") {
-        activeModel = current.modelID;
+      if (current?.providerID === "kiro" && typeof current.modelID === "string") {
+        activeModel = sanitizeDisplayText(current.modelID).replace(/\s+/g, " ").trim() || null;
+      } else {
+        activeModel = null;
       }
     } catch {}
   };
@@ -827,7 +829,7 @@ function setupOpenCodeV2Tui(ctx) {
   }
   if (typeof ctx.keymap?.layer === "function") {
     try {
-      ctx.keymap.layer(() => ({
+      const unsubLayer = ctx.keymap.layer(() => ({
         commands: [
           {
             id: "opencode-kiro.status",
@@ -835,15 +837,19 @@ function setupOpenCodeV2Tui(ctx) {
             category: "Kiro",
             onSelect: () => {
               updateActiveModel();
+              const safeModel = activeModel ? sanitizeDisplayText(activeModel).replace(/\s+/g, " ").trim() : "";
               ctx.ui?.toast?.show?.({
                 title: "Kiro (ACP)",
-                message: activeModel ? `Active model: kiro/${activeModel} (auth managed by kiro-cli)` : "Kiro provider ready via kiro-cli ACP. Select any kiro/* model.",
+                message: safeModel ? sanitizeDisplayText(`Active model: kiro/${safeModel} (auth managed by kiro-cli)`) : "Kiro provider ready via kiro-cli ACP. Select any kiro/* model.",
                 variant: "info"
               });
             }
           }
         ]
       }));
+      if (typeof unsubLayer === "function") {
+        disposers.push(unsubLayer);
+      }
     } catch {}
   }
   return () => {

@@ -5,7 +5,7 @@ import type {
   KiroCreditsSnapshot,
   KiroModelInfo,
 } from "../src/types";
-import {
+import kiroTuiDefault, {
   KiroTuiController,
   computeCreditSeverity,
   createInitialCreditsSnapshot,
@@ -16,6 +16,7 @@ import {
   formatResetDate,
   renderProgressBar,
   sanitizeDisplayText,
+  setup,
   type TuiCommandDefinition,
   type TuiPluginApi,
   type TuiSlotRegistration,
@@ -949,5 +950,284 @@ describe("Slash Commands & Slot Registration (Mock OpenCode 2.x TUI Host)", () =
     expect(statusToast.variant).toBe("warning");
 
     handle.dispose();
+  });
+});
+
+// ===========================================================================
+// 5. OPENCODE 2.3.0 V2 TUI `Definition` CONTRACT, SUB-0.1 CREDITS & NODE DIST
+// ===========================================================================
+
+describe("OpenCode 2.3.0 V2 TUI setup() Contract, Sub-0.1 Credits & Node.js dist/tui.js", () => {
+  it("formats positive sub-0.1 credits accurately alongside negative -0.01 -> '0'", () => {
+    expect(formatCreditsNumber(0.0209)).toBe("0.0209");
+    expect(formatCreditsNumber(0.0001)).toBe("0.0001");
+    expect(formatCreditsNumber(0.00001)).toBe("0");
+    expect(formatCreditsNumber(0.05)).toBe("0.05");
+    expect(formatCreditsNumber(0.09999)).toBe("0.1");
+    expect(formatCreditsNumber(-0.01)).toBe("0");
+  });
+
+  it("satisfies OpenCode 2.3.0 V2 Definition contract and registers keymap + event listener with working cleanup()", () => {
+    expect(kiroTuiDefault.id).toBe("opencode-kiro");
+    expect(typeof kiroTuiDefault.setup).toBe("function");
+    expect(typeof setup).toBe("function");
+
+    const toasts: Array<{ title?: string; message: string; variant?: string }> = [];
+    const registeredEvents = new Map<string, (ev: unknown) => void>();
+    const layers: Array<Record<string, unknown>> = [];
+    let unsubCalled = 0;
+
+    let currentModel: { providerID: string; modelID: string } | undefined = {
+      providerID: "kiro",
+      modelID: "claude-sonnet-4",
+    };
+
+    const mockV2Ctx = {
+      ui: {
+        toast: {
+          show: (opts: { title?: string; message: string; variant?: string }) => {
+            toasts.push(opts);
+          },
+        },
+        model: {
+          current: () => currentModel,
+        },
+        slot: () => () => {},
+      },
+      data: {
+        on: (type: string, handler: (event: unknown) => void) => {
+          registeredEvents.set(type, handler);
+          return () => {
+            unsubCalled += 1;
+            registeredEvents.delete(type);
+          };
+        },
+      },
+      keymap: {
+        layer: (factory: () => Record<string, unknown>) => {
+          layers.push(factory());
+        },
+      },
+    };
+
+    const cleanup = kiroTuiDefault.setup(mockV2Ctx);
+    expect(typeof cleanup).toBe("function");
+    expect(registeredEvents.has("session.status")).toBe(true);
+    expect(layers.length).toBe(1);
+
+    const commands = layers[0]!.commands as Array<{
+      id: string;
+      title: string;
+      category: string;
+      onSelect: () => void;
+    }>;
+    expect(commands.length).toBe(1);
+    expect(commands[0]!.id).toBe("opencode-kiro.status");
+
+    commands[0]!.onSelect();
+    expect(toasts.length).toBe(1);
+    expect(toasts[0]!.message).toContain("kiro/claude-sonnet-4");
+
+    // Cleanup should unsubscribe event listener and be idempotent
+    (cleanup as () => void)();
+    (cleanup as () => void)();
+    expect(unsubCalled).toBe(1);
+    expect(registeredEvents.size).toBe(0);
+  });
+
+  it("never throws if ctx.ui.model.current(), ctx.data.on(), ctx.keymap.layer(), or disposer throws", () => {
+    const throwingCtx = {
+      ui: {
+        toast: {
+          show: () => {},
+        },
+        model: {
+          current: () => {
+            throw new Error("Solid reactive read outside tracking scope");
+          },
+        },
+      },
+      data: {
+        on: () => {
+          throw new Error("Event type unavailable");
+        },
+      },
+      keymap: {
+        layer: () => {
+          throw new Error("Keymap schema mismatch");
+        },
+      },
+    };
+
+    let cleanup: unknown;
+    expect(() => {
+      cleanup = kiroTuiDefault.setup(throwingCtx);
+    }).not.toThrow();
+    expect(typeof cleanup).toBe("function");
+    expect(() => (cleanup as () => void)()).not.toThrow();
+
+    // Also verify throwing disposer is swallowed cleanly
+    const throwingDisposerCtx = {
+      data: {
+        on: () => () => {
+          throw new Error("disposer boom");
+        },
+      },
+    };
+    const cleanup2 = kiroTuiDefault.setup(throwingDisposerCtx) as () => void;
+    expect(() => cleanup2()).not.toThrow();
+  });
+
+  it("BUG CHECK: setup() V2 toast must sanitize activeModel (no ANSI or secret leakage)", () => {
+    const toasts: Array<{ title?: string; message: string; variant?: string }> = [];
+    const layers: Array<Record<string, unknown>> = [];
+
+    const mockV2Ctx = {
+      ui: {
+        toast: {
+          show: (opts: { title?: string; message: string; variant?: string }) => {
+            toasts.push(opts);
+          },
+        },
+        model: {
+          current: () => ({
+            providerID: "kiro",
+            modelID: "\x1b[31mclaude sk-secretleak1234567890\x1b[0m",
+          }),
+        },
+      },
+      keymap: {
+        layer: (factory: () => Record<string, unknown>) => {
+          layers.push(factory());
+        },
+      },
+    };
+
+    const cleanup = kiroTuiDefault.setup(mockV2Ctx) as () => void;
+    const commands = layers[0]!.commands as Array<{ onSelect: () => void }>;
+    commands[0]!.onSelect();
+
+    expect(toasts[0]!.message).not.toContain("\x1b");
+    expect(toasts[0]!.message).not.toContain("sk-secretleak1234567890");
+    cleanup();
+  });
+
+  it("BUG CHECK: setup() V2 must clear activeModel when user switches away from kiro provider", () => {
+    const toasts: Array<{ title?: string; message: string; variant?: string }> = [];
+    const layers: Array<Record<string, unknown>> = [];
+    let currentModel: { providerID: string; modelID: string } = {
+      providerID: "kiro",
+      modelID: "claude-sonnet-4",
+    };
+
+    const mockV2Ctx = {
+      ui: {
+        toast: {
+          show: (opts: { title?: string; message: string; variant?: string }) => {
+            toasts.push(opts);
+          },
+        },
+        model: {
+          current: () => currentModel,
+        },
+      },
+      keymap: {
+        layer: (factory: () => Record<string, unknown>) => {
+          layers.push(factory());
+        },
+      },
+    };
+
+    const cleanup = kiroTuiDefault.setup(mockV2Ctx) as () => void;
+    const commands = layers[0]!.commands as Array<{ onSelect: () => void }>;
+
+    // First select with kiro active
+    commands[0]!.onSelect();
+    expect(toasts.at(-1)!.message).toContain("kiro/claude-sonnet-4");
+
+    // Switch to another provider — must NOT report stale kiro/claude-sonnet-4
+    currentModel = { providerID: "anthropic", modelID: "claude-opus-4" };
+    commands[0]!.onSelect();
+    expect(toasts.at(-1)!.message).not.toContain("kiro/claude-sonnet-4");
+
+    cleanup();
+  });
+
+  it("BUG CHECK: setup() should recognize V2 context with keymap.layer even without ui.slot/ui.toast.show/data.on", () => {
+    let layerRegistered = false;
+    const keymapOnlyV2Ctx = {
+      keymap: {
+        layer: () => {
+          layerRegistered = true;
+        },
+      },
+    };
+
+    const cleanup = kiroTuiDefault.setup(keymapOnlyV2Ctx) as () => void;
+    expect(layerRegistered).toBe(true);
+    cleanup();
+  });
+
+  it("BUG CHECK: setup() cleanup should invoke disposer returned by ctx.keymap.layer()", () => {
+    let keymapDisposed = false;
+    const mockV2Ctx = {
+      ui: {
+        toast: { show: () => {} },
+      },
+      keymap: {
+        layer: () => () => {
+          keymapDisposed = true;
+        },
+      },
+    };
+
+    const cleanup = kiroTuiDefault.setup(mockV2Ctx) as () => void;
+    cleanup();
+    expect(keymapDisposed).toBe(true);
+  });
+
+  it("dist/tui.js imports and executes cleanly under real Node.js (node -e)", () => {
+    const script = `
+      import("./dist/tui.js").then((m) => {
+        if (m.default?.id !== "opencode-kiro") throw new Error("bad id");
+        if (typeof m.default?.setup !== "function") throw new Error("missing setup");
+        const toasts = [];
+        let unsubscribed = false;
+        const layers = [];
+        const cleanup = m.default.setup({
+          ui: {
+            model: { current: () => ({ providerID: "kiro", modelID: "claude-sonnet-4" }) },
+            toast: { show: (t) => toasts.push(t) },
+          },
+          data: {
+            on: () => () => { unsubscribed = true; },
+          },
+          keymap: {
+            layer: (factory) => { layers.push(factory()); },
+          },
+        });
+        layers[0].commands[0].onSelect();
+        cleanup();
+        if (!unsubscribed) throw new Error("cleanup did not unsubscribe");
+        if (toasts.length !== 1) throw new Error("toast not shown");
+        if (m.formatCreditsNumber(0.0209) !== "0.0209") throw new Error("bad sub-0.1 format");
+        if (m.formatCreditsNumber(0.0001) !== "0.0001") throw new Error("bad 0.0001 format");
+        if (m.formatCreditsNumber(0.00001) !== "0") throw new Error("bad 0.00001 format");
+        if (m.formatCreditsNumber(-0.01) !== "0") throw new Error("bad -0.01 format");
+        console.log("NODE_DIST_TUI_VERIFIED");
+      });
+    `;
+
+    const proc = Bun.spawnSync(["node", "-e", script], {
+      cwd: "/Users/sigma/Documents/antigravity/opencode-kiro",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const stdout = new TextDecoder().decode(proc.stdout);
+    const stderr = new TextDecoder().decode(proc.stderr);
+    expect(proc.exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout).toContain("NODE_DIST_TUI_VERIFIED");
   });
 });

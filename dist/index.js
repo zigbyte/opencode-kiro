@@ -599,23 +599,25 @@ class AcpAuthRequiredError extends AcpTransportError {
 var AUTH_ERROR_CODES = new Set([-32001, -32002, 401]);
 var AUTH_ERROR_PATTERN = /\b(auth|unauthenticated|unauthorized|not logged in|login required|authentication required|credentials?)\b/i;
 var THROTTLE_ERROR_PATTERN = /\b(throttl\w*|rate\s*limit\w*|too\s*many\s*requests|429|service\s*unavailable|temporarily\s*unavailable)\b/i;
-function extractJsonRpcErrorDetail(data) {
+function extractRawErrorText(data) {
   if (typeof data === "string") {
-    const trimmed = data.trim();
-    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+    return data.trim();
   }
   if (isRecord2(data) && typeof data["message"] === "string") {
-    const trimmed = data["message"].trim();
-    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+    return data["message"].trim();
   }
   return "";
+}
+function extractJsonRpcErrorDetail(data) {
+  const raw = extractRawErrorText(data);
+  return raw.length > 500 ? `${raw.slice(0, 500)}...` : raw;
 }
 function isTransientThrottleError(err) {
   if (!(err instanceof JsonRpcResponseError)) {
     return false;
   }
-  const detail = extractJsonRpcErrorDetail(err.data);
-  return THROTTLE_ERROR_PATTERN.test(err.message) || detail.length > 0 && THROTTLE_ERROR_PATTERN.test(detail);
+  const rawDetail = extractRawErrorText(err.data);
+  return THROTTLE_ERROR_PATTERN.test(err.message) || rawDetail.length > 0 && THROTTLE_ERROR_PATTERN.test(rawDetail);
 }
 function sleepAbortable(ms, signal) {
   if (!signal) {
@@ -704,6 +706,7 @@ class AcpClient {
   metadataListeners = new Set;
   parseErrorListeners = new Set;
   toolCallKinds = new Map;
+  disposeController = new AbortController;
   constructor(options = {}) {
     this.options = options;
     this.supervisor = new KiroProcessSupervisor({
@@ -828,15 +831,12 @@ class AcpClient {
     await this.ensureConnected();
     const { signal, onUpdate, timeoutMs } = options;
     let receivedMessageChunk = false;
-    let unsubUpdate;
-    if (onUpdate) {
-      unsubUpdate = this.subscribeSessionUpdates(sessionId, (updateParams) => {
-        if (updateParams.update?.sessionUpdate === "agent_message_chunk") {
-          receivedMessageChunk = true;
-        }
-        onUpdate(updateParams);
-      });
-    }
+    const unsubUpdate = this.subscribeSessionUpdates(sessionId, (updateParams) => {
+      if (updateParams.update?.sessionUpdate === "agent_message_chunk") {
+        receivedMessageChunk = true;
+      }
+      onUpdate?.(updateParams);
+    });
     const onAbort = () => {
       this.cancel(sessionId).catch(() => {});
     };
@@ -852,6 +852,7 @@ class AcpClient {
       prompt: blocks
     };
     const effectivePromptTimeoutMs = timeoutMs ?? this.options.promptTimeoutMs ?? this.options.requestTimeoutMs ?? 15 * 60000;
+    const sleepSignal = signal ? AbortSignal.any([signal, this.disposeController.signal]) : this.disposeController.signal;
     const retryDelaysMs = [2000, 5000];
     try {
       for (let attempt = 0;; attempt++) {
@@ -859,8 +860,11 @@ class AcpClient {
           return await this.request("session/prompt", params, { signal, timeoutMs: effectivePromptTimeoutMs });
         } catch (err) {
           const delayMs = retryDelaysMs[attempt];
-          if (delayMs !== undefined && !receivedMessageChunk && !signal?.aborted && isTransientThrottleError(err)) {
-            await sleepAbortable(delayMs, signal);
+          if (delayMs !== undefined && !receivedMessageChunk && !this.disposed && this.isConnected() && !signal?.aborted && isTransientThrottleError(err)) {
+            await sleepAbortable(delayMs, sleepSignal);
+            if (this.disposed || !this.isConnected()) {
+              throw new AcpTransportError("AcpClient disposed");
+            }
             continue;
           }
           throw err;
@@ -901,10 +905,12 @@ class AcpClient {
     this.connected = false;
     this.initializeResult = null;
     this.connectPromise = null;
+    this.disposeController.abort();
     this.dispatcher.rejectAll(new AcpTransportError("AcpClient disposed"));
     this.sessionUpdateListeners.clear();
     this.metadataListeners.clear();
     this.parseErrorListeners.clear();
+    this.toolCallKinds.clear();
     for (const unsub of this.supervisorUnsubs) {
       unsub();
     }

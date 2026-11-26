@@ -93,26 +93,29 @@ const AUTH_ERROR_PATTERN =
 const THROTTLE_ERROR_PATTERN =
   /\b(throttl\w*|rate\s*limit\w*|too\s*many\s*requests|429|service\s*unavailable|temporarily\s*unavailable)\b/i;
 
-function extractJsonRpcErrorDetail(data: unknown): string {
+function extractRawErrorText(data: unknown): string {
   if (typeof data === "string") {
-    const trimmed = data.trim();
-    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+    return data.trim();
   }
   if (isRecord(data) && typeof data["message"] === "string") {
-    const trimmed = data["message"].trim();
-    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+    return data["message"].trim();
   }
   return "";
+}
+
+function extractJsonRpcErrorDetail(data: unknown): string {
+  const raw = extractRawErrorText(data);
+  return raw.length > 500 ? `${raw.slice(0, 500)}...` : raw;
 }
 
 function isTransientThrottleError(err: unknown): boolean {
   if (!(err instanceof JsonRpcResponseError)) {
     return false;
   }
-  const detail = extractJsonRpcErrorDetail(err.data);
+  const rawDetail = extractRawErrorText(err.data);
   return (
     THROTTLE_ERROR_PATTERN.test(err.message) ||
-    (detail.length > 0 && THROTTLE_ERROR_PATTERN.test(detail))
+    (rawDetail.length > 0 && THROTTLE_ERROR_PATTERN.test(rawDetail))
   );
 }
 
@@ -245,6 +248,7 @@ export class AcpClient {
   >();
 
   private readonly toolCallKinds = new Map<string, string>();
+  private readonly disposeController = new AbortController();
 
   constructor(options: KiroPluginOptions = {}) {
     this.options = options;
@@ -425,15 +429,12 @@ export class AcpClient {
     const { signal, onUpdate, timeoutMs } = options;
 
     let receivedMessageChunk = false;
-    let unsubUpdate: (() => void) | undefined;
-    if (onUpdate) {
-      unsubUpdate = this.subscribeSessionUpdates(sessionId, (updateParams) => {
-        if (updateParams.update?.sessionUpdate === "agent_message_chunk") {
-          receivedMessageChunk = true;
-        }
-        onUpdate(updateParams);
-      });
-    }
+    const unsubUpdate = this.subscribeSessionUpdates(sessionId, (updateParams) => {
+      if (updateParams.update?.sessionUpdate === "agent_message_chunk") {
+        receivedMessageChunk = true;
+      }
+      onUpdate?.(updateParams);
+    });
 
     const onAbort = (): void => {
       void this.cancel(sessionId).catch(() => {
@@ -460,6 +461,10 @@ export class AcpClient {
       this.options.requestTimeoutMs ??
       15 * 60_000;
 
+    const sleepSignal = signal
+      ? AbortSignal.any([signal, this.disposeController.signal])
+      : this.disposeController.signal;
+
     const retryDelaysMs = [2000, 5000];
     try {
       for (let attempt = 0; ; attempt++) {
@@ -474,10 +479,15 @@ export class AcpClient {
           if (
             delayMs !== undefined &&
             !receivedMessageChunk &&
+            !this.disposed &&
+            this.isConnected() &&
             !signal?.aborted &&
             isTransientThrottleError(err)
           ) {
-            await sleepAbortable(delayMs, signal);
+            await sleepAbortable(delayMs, sleepSignal);
+            if (this.disposed || !this.isConnected()) {
+              throw new AcpTransportError("AcpClient disposed");
+            }
             continue;
           }
           throw err;
@@ -538,11 +548,13 @@ export class AcpClient {
     this.connected = false;
     this.initializeResult = null;
     this.connectPromise = null;
+    this.disposeController.abort();
 
     this.dispatcher.rejectAll(new AcpTransportError("AcpClient disposed"));
     this.sessionUpdateListeners.clear();
     this.metadataListeners.clear();
     this.parseErrorListeners.clear();
+    this.toolCallKinds.clear();
 
     for (const unsub of this.supervisorUnsubs) {
       unsub();

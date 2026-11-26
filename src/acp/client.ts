@@ -101,6 +101,12 @@ const READ_ONLY_TOOL_KINDS = new Set([
   "view",
   "find",
   "think",
+  "subagent",
+  "use_subagent",
+  "agent_task",
+  "task",
+  "todo",
+  "todo_list",
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {

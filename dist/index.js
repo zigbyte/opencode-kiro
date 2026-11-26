@@ -608,7 +608,13 @@ var READ_ONLY_TOOL_KINDS = new Set([
   "web_search",
   "view",
   "find",
-  "think"
+  "think",
+  "subagent",
+  "use_subagent",
+  "agent_task",
+  "task",
+  "todo",
+  "todo_list"
 ]);
 function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);

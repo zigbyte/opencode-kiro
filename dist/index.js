@@ -807,8 +807,9 @@ class AcpClient {
       sessionId,
       prompt: blocks
     };
+    const effectivePromptTimeoutMs = timeoutMs ?? this.options.promptTimeoutMs ?? this.options.requestTimeoutMs ?? 15 * 60000;
     try {
-      return await this.request("session/prompt", params, { signal, timeoutMs });
+      return await this.request("session/prompt", params, { signal, timeoutMs: effectivePromptTimeoutMs });
     } catch (err) {
       throw this.wrapError(err, "session/prompt");
     } finally {

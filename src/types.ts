@@ -267,8 +267,10 @@ export interface KiroPluginOptions {
   acpArgs?: string[];
   /** Default working directory for ACP sessions */
   cwd?: string;
-  /** Request timeout in milliseconds */
+  /** Control RPC request timeout in milliseconds (default: 60000) */
   requestTimeoutMs?: number;
+  /** Streaming `session/prompt` timeout in milliseconds (default: 900000 = 15m) */
+  promptTimeoutMs?: number;
   /** Model discovery cache TTL in milliseconds */
   modelCacheTtlMs?: number;
   /** Permission policy for ACP session/request_permission callbacks */

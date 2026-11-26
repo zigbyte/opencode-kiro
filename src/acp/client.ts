@@ -402,11 +402,17 @@ export class AcpClient {
       prompt: blocks,
     };
 
+    const effectivePromptTimeoutMs =
+      timeoutMs ??
+      this.options.promptTimeoutMs ??
+      this.options.requestTimeoutMs ??
+      15 * 60_000;
+
     try {
       return await this.request<AcpPromptResult>(
         "session/prompt",
         params as unknown as Record<string, unknown>,
-        { signal, timeoutMs }
+        { signal, timeoutMs: effectivePromptTimeoutMs }
       );
     } catch (err) {
       throw this.wrapError(err, "session/prompt");

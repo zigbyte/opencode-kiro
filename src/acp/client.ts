@@ -90,6 +90,52 @@ const AUTH_ERROR_CODES = new Set([-32001, -32002, 401]);
 const AUTH_ERROR_PATTERN =
   /\b(auth|unauthenticated|unauthorized|not logged in|login required|authentication required|credentials?)\b/i;
 
+const THROTTLE_ERROR_PATTERN =
+  /\b(throttl\w*|rate\s*limit\w*|too\s*many\s*requests|429|service\s*unavailable|temporarily\s*unavailable)\b/i;
+
+function extractJsonRpcErrorDetail(data: unknown): string {
+  if (typeof data === "string") {
+    const trimmed = data.trim();
+    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+  }
+  if (isRecord(data) && typeof data["message"] === "string") {
+    const trimmed = data["message"].trim();
+    return trimmed.length > 500 ? `${trimmed.slice(0, 500)}...` : trimmed;
+  }
+  return "";
+}
+
+function isTransientThrottleError(err: unknown): boolean {
+  if (!(err instanceof JsonRpcResponseError)) {
+    return false;
+  }
+  const detail = extractJsonRpcErrorDetail(err.data);
+  return (
+    THROTTLE_ERROR_PATTERN.test(err.message) ||
+    (detail.length > 0 && THROTTLE_ERROR_PATTERN.test(detail))
+  );
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(new AcpTransportError("Operation was aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new AcpTransportError("Operation was aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 const READ_ONLY_TOOL_KINDS = new Set([
   "read",
   "search",
@@ -378,9 +424,15 @@ export class AcpClient {
 
     const { signal, onUpdate, timeoutMs } = options;
 
+    let receivedMessageChunk = false;
     let unsubUpdate: (() => void) | undefined;
     if (onUpdate) {
-      unsubUpdate = this.subscribeSessionUpdates(sessionId, onUpdate);
+      unsubUpdate = this.subscribeSessionUpdates(sessionId, (updateParams) => {
+        if (updateParams.update?.sessionUpdate === "agent_message_chunk") {
+          receivedMessageChunk = true;
+        }
+        onUpdate(updateParams);
+      });
     }
 
     const onAbort = (): void => {
@@ -408,12 +460,29 @@ export class AcpClient {
       this.options.requestTimeoutMs ??
       15 * 60_000;
 
+    const retryDelaysMs = [2000, 5000];
     try {
-      return await this.request<AcpPromptResult>(
-        "session/prompt",
-        params as unknown as Record<string, unknown>,
-        { signal, timeoutMs: effectivePromptTimeoutMs }
-      );
+      for (let attempt = 0; ; attempt++) {
+        try {
+          return await this.request<AcpPromptResult>(
+            "session/prompt",
+            params as unknown as Record<string, unknown>,
+            { signal, timeoutMs: effectivePromptTimeoutMs }
+          );
+        } catch (err) {
+          const delayMs = retryDelaysMs[attempt];
+          if (
+            delayMs !== undefined &&
+            !receivedMessageChunk &&
+            !signal?.aborted &&
+            isTransientThrottleError(err)
+          ) {
+            await sleepAbortable(delayMs, signal);
+            continue;
+          }
+          throw err;
+        }
+      }
     } catch (err) {
       throw this.wrapError(err, "session/prompt");
     } finally {
@@ -770,8 +839,10 @@ export class AcpClient {
       return err;
     }
     if (err instanceof JsonRpcResponseError) {
+      const detail = extractJsonRpcErrorDetail(err.data);
+      const suffix = detail && !err.message.includes(detail) ? ` — ${detail}` : "";
       return new AcpTransportError(
-        `ACP "${method}" failed (${err.code}): ${err.message}`,
+        `ACP "${method}" failed (${err.code}): ${err.message}${suffix}`,
         {
           code: err.code,
           data: err.data,
